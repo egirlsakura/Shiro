@@ -1012,6 +1012,79 @@ def embed_conteudo(titulo: str, tipo: str, plataforma: str, origem: str, mid: in
     return emb
 
 
+def botoes_streaming_conteudo(titulo: str, tipo: str, plataforma: str,
+                              origem: str, mid: int) -> discord.ui.View:
+    """Links legais de consulta/busca, sem afirmar que o título já está no streaming."""
+    view = discord.ui.View(timeout=None)
+    eh_filme = tipo in TIPOS_FILME
+    if origem == "tmdb":
+        tipo_tmdb = "movie" if eh_filme else "tv"
+        view.add_item(discord.ui.Button(
+            label="Onde assistir (Brasil)",
+            url=f"https://www.themoviedb.org/{tipo_tmdb}/{mid}/watch?locale=BR"))
+    else:
+        view.add_item(discord.ui.Button(
+            label="Detalhes no TVmaze", url=f"https://www.tvmaze.com/shows/{mid}"))
+    # Links de BUSCA: não são links diretos de reprodução ou prova de disponibilidade.
+    nome = plataforma.strip()[:55]
+    q = quote_plus(titulo)
+    pl = normalizar(nome)
+    sites = (
+        ("netflix", f"https://www.netflix.com/search?q={q}"),
+        ("crunchyroll", f"https://www.crunchyroll.com/search?q={q}"),
+        ("viki", f"https://www.viki.com/search?q={q}"),
+    )
+    url_plataforma = next((link for palavra, link in sites if palavra in pl), None)
+    if not url_plataforma:
+        url_plataforma = "https://www.google.com/search?q=" + quote_plus(f"{titulo} {nome} assistir")
+    view.add_item(discord.ui.Button(label=f"Buscar na {nome or 'plataforma'}"[:80],
+                                    url=url_plataforma))
+    view.add_item(discord.ui.Button(label="Buscar onde assistir",
+             url="https://www.google.com/search?q=" + quote_plus(f"{titulo} onde assistir Brasil")))
+    return view
+
+
+def aviso_teste_conteudo(titulo: str, tipo: str, plataforma: str,
+                         origem: str, mid: int, ep: dict,
+                         poster_url: Optional[str] = None):
+    emb = embed_conteudo(titulo, tipo, plataforma, origem, mid, ep, poster_url)
+    emb.title = f"🧪 TESTE | {'Estreia' if tipo in TIPOS_FILME else 'Episódio'}: {titulo}"[:256]
+    emb.description = ("**Aviso de teste, não é um lançamento neste momento.**\n"
+                       + (emb.description or ""))[:4096]
+    return emb
+
+
+async def enviar_teste_conteudo(canal, titulo: str, tipo: str, plataforma: str,
+                                origem: str, mid: int, tvmaze_id: Optional[int],
+                                poster_url: Optional[str] = None) -> bool:
+    """Envia apenas lançamentos que já ocorreram, não marca aviso real como entregue."""
+    eps = await buscar_lancamentos(origem, mid, tvmaze_id, tipo)
+    agora = datetime.now(timezone.utc)
+    anteriores = [ep for ep in eps if ep.get("quando") and ep["quando"] <= agora]
+    if not anteriores:
+        return False
+    ep = max(anteriores, key=lambda e: e["quando"])
+    await canal.send(embed=aviso_teste_conteudo(titulo, tipo, plataforma, origem,
+                      mid, ep, poster_url),
+                     view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid))
+    return True
+
+
+async def validar_canal_teste(inter: discord.Interaction, canal: discord.TextChannel) -> Optional[str]:
+    if not inter.guild or canal.guild.id != inter.guild.id:
+        return "Use o comando em um servidor e escolha um canal deste servidor."
+    perms_usuario = canal.permissions_for(inter.user)
+    if not perms_usuario.view_channel or not perms_usuario.send_messages:
+        return "Você não tem permissão para enviar mensagens nesse canal."
+    membro_bot = inter.guild.me
+    if not membro_bot:
+        return "Não consegui verificar as permissões do bot no servidor."
+    p = canal.permissions_for(membro_bot)
+    if not (p.view_channel and p.send_messages and p.embed_links):
+        return "O bot precisa das permissões **Ver canal**, **Enviar mensagens** e **Incorporar links** no canal."
+    return None
+
+
 async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
     # rows: (user_id, titulo, tipo, plataforma, criado_em)
     agora = datetime.now(timezone.utc)
@@ -1055,6 +1128,7 @@ async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
                 continue
             try:
                 await c.send(" ".join(f"<@{u}>" for u in pessoas), embed=emb,
+                             view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid),
                              allowed_mentions=discord.AllowedMentions(users=True))
                 marcar_entregue("canal", cid, origem, mid, ep["key"], tipo)
             except discord.HTTPException as e:
@@ -1064,7 +1138,8 @@ async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
                 continue
             try:
                 target = await bot.fetch_user(uid)
-                await target.send(embed=emb)
+                await target.send(embed=emb,
+                                  view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid))
                 marcar_entregue("dm", uid, origem, mid, ep["key"], tipo)
             except discord.HTTPException as e:
                 print(f"Falha no aviso {tipo} para DM {uid}: {e}")
@@ -1103,33 +1178,32 @@ async def esperar_conteudos():
     await bot.wait_until_ready()
 
 
-@bot.tree.command(name="testar_conteudo", description="Testa neste canal o aviso de um título da sua lista")
+@bot.tree.command(name="testar_conteudo", description="Testa o último episódio/estreia de um título da sua lista")
 @app_commands.guild_only()
-@app_commands.describe(numero="Número mostrado em /meus_conteudos")
-async def testar_conteudo(inter: discord.Interaction, numero: app_commands.Range[int, 1, 100000]):
-    rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id
+@app_commands.describe(numero="Número mostrado em /meus_conteudos", canal="Canal que receberá o teste (opcional)")
+async def testar_conteudo(inter: discord.Interaction, numero: app_commands.Range[int, 1, 100000],
+                          canal: Optional[discord.TextChannel] = None):
+    rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
                          FROM conteudos_seguidos WHERE user_id=? ORDER BY id""",
                       (inter.user.id,)).fetchall()
     if numero > len(rows):
         return await inter.response.send_message("Número inválido. Veja `/meus_conteudos`.", ephemeral=True)
-    titulo, tipo, plat, origem, mid, maze = rows[numero-1]
-    if not mid:
+    titulo, tipo, plat, origem, mid, maze, poster = rows[numero-1]
+    if not origem or not mid:
         return await inter.response.send_message("Recadastre este conteúdo em `/seguir_conteudo`.", ephemeral=True)
+    destino = canal or inter.channel
+    erro = await validar_canal_teste(inter, destino)
+    if erro:
+        return await inter.response.send_message("⚠️ " + erro, ephemeral=True)
     await inter.response.defer(ephemeral=True)
     try:
-        eps = await buscar_lancamentos(origem, mid, maze, tipo)
-        if not eps:
-            return await inter.followup.send("Não há datas ou episódios cadastrados para esse título.", ephemeral=True)
-        ep = sorted(eps, key=lambda x:x["quando"])[-1]
-        poster_row = db.execute("""SELECT poster_url FROM conteudos_seguidos
-                                   WHERE user_id=? AND origem=? AND mid=? LIMIT 1""",
-                                (inter.user.id, origem, mid)).fetchone()
-        await inter.channel.send(content="🧪 **TESTE DE AVISO**",
-                                 embed=embed_conteudo(titulo, tipo, plat, origem, mid, ep,
-                                                      poster_row[0] if poster_row else None))
-        await inter.followup.send("✅ Mensagem de teste enviada neste canal.", ephemeral=True)
+        enviou = await enviar_teste_conteudo(destino, titulo, tipo, plat, origem, mid, maze, poster)
     except Exception as e:
-        await inter.followup.send(f"Não consegui consultar ou enviar o teste: {type(e).__name__}", ephemeral=True)
+        print("Erro no teste de conteúdo:", type(e).__name__, e)
+        return await inter.followup.send(f"⚠️ Não consegui consultar ou enviar o teste ({type(e).__name__}).", ephemeral=True)
+    if not enviou:
+        return await inter.followup.send("Não há episódios/estreias **já lançados** com data registrada para este título.", ephemeral=True)
+    await inter.followup.send(f"✅ Teste de **{tipo}** enviado em {destino.mention}, com os botões de streaming.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1706,12 +1780,17 @@ def montar_aviso(ep: dict, modo: str):
 
 
 def kw_aviso(emb: discord.Embed, links: list[dict], com_botoes: bool) -> dict:
-    """Monta os argumentos do send(). Cria uma View nova a cada chamada."""
+    """Cria botões oficiais quando existirem; senão, oferece busca de streaming."""
     kwargs = {"embed": emb}
-    if links and com_botoes:
+    if com_botoes:
         view = discord.ui.View()
-        for l in links:
+        for l in links[:5]:
             view.add_item(discord.ui.Button(label=f"Assistir na {l['site']}"[:80], url=l["url"]))
+        if not links:
+            nome_anime = (emb.title or "Anime").split(" — ")[0]
+            nome_anime = nome_anime.replace("🧪 TESTE", "").replace("📺", "").strip(" —")
+            view.add_item(discord.ui.Button(label="Buscar onde assistir", url=
+                "https://www.google.com/search?q=" + quote_plus(f"{nome_anime} assistir anime oficialmente")))
         kwargs["view"] = view
     return kwargs
 
@@ -1754,7 +1833,8 @@ async def enviar(ep: dict, lembrete: bool):
 
 
 # ---------------------------------------------------------------------------
-# /testar: botão que envia, neste canal, o episódio mais recente já lançado
+# /testar: botão para testar qualquer categoria num canal escolhido.
+# O aviso de teste não marca um lançamento real como entregue.
 # ---------------------------------------------------------------------------
 async def ultimo_episodio(media_id: int) -> Optional[dict]:
     q = """query($id:Int,$now:Int){Page(perPage:1){
@@ -1768,48 +1848,111 @@ async def ultimo_episodio(media_id: int) -> Optional[dict]:
 
 
 class TesteView(discord.ui.View):
-    def __init__(self, media_id: Optional[int]):
+    def __init__(self, usuario_id: int, categoria: str, canal_id: int,
+                 media_id: Optional[int] = None):
         super().__init__(timeout=300)
+        self.usuario_id = usuario_id
+        self.categoria = categoria
+        self.canal_id = canal_id
         self.media_id = media_id
+        self.enviado = False
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.usuario_id:
+            await inter.response.send_message("Somente quem usou `/testar` pode clicar neste botão.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Enviar aviso de teste", emoji="🧪", style=discord.ButtonStyle.primary)
     async def enviar_teste(self, inter: discord.Interaction, button: discord.ui.Button):
+        if self.enviado:
+            return await inter.response.send_message("O teste já foi enviado. Use `/testar` novamente.", ephemeral=True)
+        destino = inter.guild.get_channel(self.canal_id) if inter.guild else None
+        if not destino:
+            return await inter.response.send_message("O canal de teste não está mais disponível.", ephemeral=True)
+        erro = await validar_canal_teste(inter, destino)
+        if erro:
+            return await inter.response.send_message("⚠️ " + erro, ephemeral=True)
+        self.enviado = True
         await inter.response.defer(ephemeral=True)
-        if self.media_id:
-            ids = [self.media_id]
-        else:
-            ids = [r[0] for r in db.execute(
-                "SELECT media_id FROM follows WHERE user_id=? ORDER BY rowid", (inter.user.id,))]
-
-        ep = None
-        for mid in ids:
-            try:
-                ep = await ultimo_episodio(mid)
-            except Exception as e:
-                print("Erro no teste:", e)
-            if ep:
-                break
-        if not ep:
-            return await inter.followup.send("Não achei nenhum episódio já lançado nos animes escolhidos.")
-
-        emb, links = montar_aviso(ep, "teste")
         try:
-            await inter.channel.send(**kw_aviso(emb, links, True))
-        except discord.Forbidden:
-            return await inter.followup.send(
-                "⚠️ Não tenho permissão para enviar mensagens neste canal. "
-                "Dê ao bot **Ver canais**, **Enviar mensagens** e **Incorporar links** aqui.")
-        await inter.followup.send("✅ Teste enviado neste canal.")
+            melhor = None  # (data_lancamento, titulo, ep, row/conteudo)
+            if self.categoria == "Anime":
+                ids = ([self.media_id] if self.media_id else [r[0] for r in db.execute(
+                    "SELECT media_id FROM follows WHERE user_id=?", (inter.user.id,))])
+                for mid in ids:
+                    try:
+                        ep = await ultimo_episodio(mid)
+                        if ep and (melhor is None or ep["airingAt"] > melhor[0]):
+                            melhor = (ep["airingAt"], "anime", ep)
+                    except Exception as e:
+                        print("Erro ao consultar anime para teste:", type(e).__name__)
+            if not self.media_id:
+                rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
+                    FROM conteudos_seguidos WHERE user_id=? AND tipo=? AND origem IS NOT NULL AND mid IS NOT NULL""",
+                    (inter.user.id, self.categoria)).fetchall()
+                now = datetime.now(timezone.utc)
+                for titulo, tipo, plat, origem, mid, maze, poster in rows:
+                    try:
+                        episodes = await buscar_lancamentos(origem, mid, maze, tipo)
+                        anteriores = [ep for ep in episodes if ep.get("quando") and ep["quando"] <= now]
+                        if anteriores:
+                            ultimo = max(anteriores, key=lambda e: e["quando"])
+                            stamp = ultimo["quando"].timestamp()
+                            if melhor is None or stamp > melhor[0]:
+                                melhor = (stamp, "conteudo", (titulo, tipo, plat, origem, mid, poster, ultimo))
+                    except Exception as e:
+                        print("Erro ao consultar conteúdo para teste:", type(e).__name__)
+            if not melhor:
+                self.enviado = False
+                return await inter.followup.send(
+                    f"Nenhum lançamento anterior à data atual foi encontrado para **{self.categoria}**. "
+                    "Cadastre obras com `/seguir` ou `/seguir_conteudo` e tente novamente.", ephemeral=True)
+            if melhor[1] == "anime":
+                emb, links = montar_aviso(melhor[2], "teste")
+                await destino.send(**kw_aviso(emb, links, True))
+            else:
+                titulo, tipo, plat, origem, mid, poster, ep = melhor[2]
+                await destino.send(embed=aviso_teste_conteudo(titulo, tipo, plat, origem, mid, ep, poster),
+                    view=botoes_streaming_conteudo(titulo, tipo, plat, origem, mid))
+            button.disabled = True
+            await inter.edit_original_response(view=self)
+            await inter.followup.send(f"✅ Teste de **{self.categoria}** enviado em {destino.mention}.", ephemeral=True)
+        except discord.HTTPException as e:
+            self.enviado = False
+            await inter.followup.send(f"⚠️ Falha ao enviar o teste no Discord: {e}", ephemeral=True)
+        except Exception as e:
+            self.enviado = False
+            print("Erro no teste:", type(e).__name__, e)
+            await inter.followup.send(f"⚠️ Não foi possível preparar o teste: {type(e).__name__}.", ephemeral=True)
 
 
-@bot.tree.command(name="testar", description="Envia neste canal um aviso de teste com o último episódio lançado")
-@app_commands.describe(anime="Anime para testar (opcional; sem escolher, usa o primeiro da sua lista com episódio lançado)")
+@bot.tree.command(name="testar", description="Testar aviso de anime, dorama, K-drama, série ou filme com botões")
+@app_commands.guild_only()
+@app_commands.describe(anime="Anime específico de /seguir (opcional)",
+                       categoria="Tipo de conteúdo (padrão: Anime)",
+                       canal="Canal que receberá o teste (padrão: canal atual)")
+@app_commands.choices(categoria=TIPOS_CONTEUDO)
 @app_commands.autocomplete(anime=seguindo_ac)
-async def testar(inter: discord.Interaction, anime: Optional[str] = None):
-    media_id = int(anime) if anime and anime.isdigit() else None
+async def testar(inter: discord.Interaction, anime: Optional[str] = None,
+                 categoria: Optional[app_commands.Choice[str]] = None,
+                 canal: Optional[discord.TextChannel] = None):
+    tipo = categoria.value if categoria else "Anime"
+    if anime and tipo != "Anime":
+        return await inter.response.send_message("Escolha a categoria Anime ao informar um anime específico.", ephemeral=True)
+    if anime and not anime.isdigit():
+        return await inter.response.send_message("Selecione um anime da lista de sugestões.", ephemeral=True)
+    destino = canal or inter.channel
+    erro = await validar_canal_teste(inter, destino)
+    if erro:
+        return await inter.response.send_message("⚠️ " + erro, ephemeral=True)
     await inter.response.send_message(
-        "Clique no botão para enviar um aviso de teste **neste canal**, com os botões de assistir.",
-        view=TesteView(media_id), ephemeral=True)
+        f"🧪 **Teste de aviso: {tipo}**\nDestino: {destino.mention}\n"
+        "O bot usará o **lançamento já ocorrido mais recente** das obras que você acompanha "
+        "nessa categoria e enviará uma prévia com os botões disponíveis.\n\n"
+        "**Atenção:** os botões para séries/filmes são links de consulta ou busca; "
+        "não garantem que a obra esteja disponível no streaming informado.",
+        view=TesteView(inter.user.id, tipo, destino.id, int(anime) if anime else None), ephemeral=True)
 
 
 @tasks.loop(minutes=5)
