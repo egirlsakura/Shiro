@@ -9,7 +9,7 @@ import time
 import uuid
 import zipfile
 from typing import Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import unicodedata
@@ -1018,20 +1018,66 @@ def embed_conteudo(titulo: str, tipo: str, plataforma: str, origem: str, mid: in
     return emb
 
 
+_cache_catalogo: dict[tuple[str, int, str], tuple[float, dict]] = {}
+
+
+async def buscar_fontes_catalogo(origem: str, mid: int, tipo: str) -> dict:
+    """TMDB/JustWatch (disponibilidade BR), IMDb/TVmaze; URLs são de catálogo."""
+    chave = (origem, int(mid), tipo)
+    cache = _cache_catalogo.get(chave)
+    if cache and time.monotonic() - cache[0] < 21600:
+        return cache[1]
+    resp = {"onde_assistir": None, "imdb": None, "site_oficial": None, "provedores": []}
+    try:
+        if origem == "tmdb":
+            categoria = "movie" if tipo in TIPOS_FILME else "tv"
+            fontes, ids = await asyncio.gather(
+                tmdb_json(f"/{categoria}/{mid}/watch/providers"),
+                tmdb_json(f"/{categoria}/{mid}/external_ids"),
+                return_exceptions=True)
+            if isinstance(fontes, dict):
+                br = (fontes.get("results") or {}).get("BR") or {}
+                resp["onde_assistir"] = url_legal_externa(br.get("link"))
+                resp["provedores"] = [p.get("provider_name") for p in (br.get("flatrate") or [])
+                                        if isinstance(p, dict) and p.get("provider_name")]
+            if isinstance(ids, dict):
+                resp["imdb"] = ids.get("imdb_id")
+        elif origem == "tvmaze":
+            show = await api_json(f"{TVMAZE_API}/shows/{int(mid)}") or {}
+            resp["imdb"] = (show.get("externals") or {}).get("imdb")
+            resp["site_oficial"] = url_legal_externa(show.get("officialSite"))
+    except Exception as exc:
+        print("Metadados de streaming indisponíveis:", type(exc).__name__)
+    _cache_catalogo[chave] = (time.monotonic(), resp)
+    return resp
+
+
 def botoes_streaming_conteudo(titulo: str, tipo: str, plataforma: str,
-                              origem: str, mid: int) -> discord.ui.View:
-    """Links legais de consulta/busca, sem afirmar que o título já está no streaming."""
+                              origem: str, mid: int,
+                              fontes: Optional[dict] = None) -> discord.ui.View:
+    """Nunca apresenta link de catálogo como se fosse reprodução do episódio."""
     view = discord.ui.View(timeout=None)
+    fontes = fontes or {}
     eh_filme = tipo in TIPOS_FILME
+    urls = set()
+
+    def botao(rotulo: str, url: Optional[str]):
+        url = url_legal_externa(url)
+        if not url or url in urls or len(view.children) >= 5:
+            return
+        urls.add(url)
+        view.add_item(discord.ui.Button(label=rotulo[:80], url=url))
+
+    # TMDB indica provedores por região, mas NÃO retorna URL do episódio.
+    if fontes.get("onde_assistir"):
+        botao("Onde assistir (Brasil) · JustWatch", fontes["onde_assistir"])
     if origem == "tmdb":
-        tipo_tmdb = "movie" if eh_filme else "tv"
-        view.add_item(discord.ui.Button(
-            label="Onde assistir (Brasil)",
-            url=f"https://www.themoviedb.org/{tipo_tmdb}/{mid}/watch?locale=BR"))
+        tp = "movie" if eh_filme else "tv"
+        botao("Ver plataformas no TMDB",
+              f"https://www.themoviedb.org/{tp}/{mid}/watch?locale=BR")
     else:
-        view.add_item(discord.ui.Button(
-            label="Detalhes no TVmaze", url=f"https://www.tvmaze.com/shows/{mid}"))
-    # Links de BUSCA: não são links diretos de reprodução ou prova de disponibilidade.
+        botao("Detalhes no TVmaze", f"https://www.tvmaze.com/shows/{mid}")
+
     nome = plataforma.strip()[:55]
     q = quote_plus(titulo)
     pl = normalizar(nome)
@@ -1043,12 +1089,14 @@ def botoes_streaming_conteudo(titulo: str, tipo: str, plataforma: str,
     url_plataforma = next((link for palavra, link in sites if palavra in pl), None)
     if not url_plataforma:
         url_plataforma = "https://www.google.com/search?q=" + quote_plus(f"{titulo} {nome} assistir")
-    view.add_item(discord.ui.Button(label=f"Buscar na {nome or 'plataforma'}"[:80],
-                                    url=url_plataforma))
-    view.add_item(discord.ui.Button(label="Buscar onde assistir",
-             url="https://www.google.com/search?q=" + quote_plus(f"{titulo} onde assistir Brasil")))
+    botao(f"Pesquisar na {nome or 'plataforma'}", url_plataforma)
+    imdb = fontes.get("imdb")
+    if isinstance(imdb, str) and re.fullmatch(r"tt\d{5,12}", imdb):
+        botao("Consultar IMDb", f"https://www.imdb.com/title/{imdb}/")
+    botao("Site oficial da obra", fontes.get("site_oficial"))
+    botao("Buscar onde assistir", "https://www.google.com/search?q=" +
+          quote_plus(f"{titulo} onde assistir legalmente Brasil"))
     return view
-
 
 def aviso_teste_conteudo(titulo: str, tipo: str, plataforma: str,
                          origem: str, mid: int, ep: dict,
@@ -1072,7 +1120,8 @@ async def enviar_teste_conteudo(canal, titulo: str, tipo: str, plataforma: str,
     ep = max(anteriores, key=lambda e: e["quando"])
     await canal.send(embed=aviso_teste_conteudo(titulo, tipo, plataforma, origem,
                       mid, ep, poster_url),
-                     view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid))
+                     view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid,
+                             await buscar_fontes_catalogo(origem, mid, tipo)))
     return True
 
 
@@ -1126,6 +1175,7 @@ async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
               (origem, mid, tipo)).fetchone()
         emb = embed_conteudo(titulo, tipo, plataforma, origem, mid, ep,
                              poster_row[0] if poster_row else None)
+        fontes = await buscar_fontes_catalogo(origem, mid, tipo)
         for cid, pessoas in subs_canais.items():
             if registro_ja_entregue("canal", cid, origem, mid, ep["key"], tipo):
                 continue
@@ -1134,7 +1184,7 @@ async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
                 continue
             try:
                 await c.send(" ".join(f"<@{u}>" for u in pessoas), embed=emb,
-                             view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid),
+                             view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid, fontes),
                              allowed_mentions=discord.AllowedMentions(users=True))
                 marcar_entregue("canal", cid, origem, mid, ep["key"], tipo)
             except discord.HTTPException as e:
@@ -1145,7 +1195,7 @@ async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
             try:
                 target = await bot.fetch_user(uid)
                 await target.send(embed=emb,
-                                  view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid))
+                                  view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid, fontes))
                 marcar_entregue("dm", uid, origem, mid, ep["key"], tipo)
             except discord.HTTPException as e:
                 print(f"Falha no aviso {tipo} para DM {uid}: {e}")
@@ -1753,9 +1803,116 @@ async def manga(inter: discord.Interaction, titulo: str):
     await inter.followup.send(embed=emb, view=view)
 
 
+def url_legal_externa(url: Optional[str]) -> Optional[str]:
+    """Só constrói botões para URLs HTTPS sem credenciais e sem hosts locais."""
+    if not isinstance(url, str) or not 8 <= len(url) <= 1800:
+        return None
+    try:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if (parsed.scheme != "https" or not host or "." not in host
+                or parsed.username or parsed.password or parsed.port not in (None, 443)):
+            return None
+        if (host == "localhost" or host.endswith((".local", ".internal"))
+                or host.startswith(("127.", "10.", "192.168.", "169.254.", "172.16."))):
+            return None
+        if any(ch.isspace() for ch in url):
+            return None
+        return url
+    except ValueError:
+        return None
+
+
+def numero_episodio_em_titulo(titulo: str) -> Optional[int]:
+    """Exige número explícito de episódio; não usa números aleatórios do título."""
+    if not isinstance(titulo, str):
+        return None
+    texto = unicodedata.normalize("NFKD", titulo).encode("ascii", "ignore").decode().lower()
+    padroes = (
+        r"\bs\d{1,3}\s*e\s*0*(\d{1,4})\b",  # S01E03
+        r"\b(?:episode|episodio|episodios|ep)\s*[#.:\-]?\s*0*(\d{1,4})\b",
+        r"^\s*#?0*(\d{1,4})(?:\s*[-:|.]\s*|\s*$)",
+    )
+    for padrao in padroes:
+        m = re.search(padrao, texto, re.I)
+        if m:
+            num = int(m.group(1))
+            if 1 <= num <= 9999:
+                return num
+    return None
+
+
+def encontrar_streaming_episodio(media: dict, episodio: int) -> Optional[dict]:
+    """Só liga ao episódio exato nos dados 'streamingEpisodes' do AniList.
+
+    Links gerais da obra / streamingLinks NÃO são URLs de episódio.
+    """
+    if not isinstance(episodio, int) or episodio < 1:
+        return None
+    encontrados = []
+    for item in media.get("streamingEpisodes") or []:
+        if numero_episodio_em_titulo(item.get("title") or "") != episodio:
+            continue
+        url = url_legal_externa(item.get("url"))
+        if not url:
+            continue
+        site = str(item.get("site") or "streaming")[:60]
+        preferencial = any(re.search(p, site.lower()) for p in PLATAFORMAS)
+        encontrados.append((not preferencial, site.lower(), {"url": url, "site": site}))
+    encontrados.sort(key=lambda x: (x[0], x[1]))
+    return encontrados[0][2] if encontrados else None
+
+
+_cache_anilist_episodios: dict[int, tuple[float, dict]] = {}
+
+
+async def enriquecer_midia_anilist(media: dict) -> dict:
+    """Consulta informações dos episódios apenas se ainda não vierem da busca."""
+    if "streamingEpisodes" in media and "idMal" in media:
+        return media
+    mid = media.get("id")
+    if not mid:
+        return media
+    cache = _cache_anilist_episodios.get(int(mid))
+    if cache and time.monotonic() - cache[0] < 3600:
+        return {**media, **cache[1]}
+    q = """query($id:Int){Media(id:$id,type:ANIME){id idMal
+        streamingEpisodes{title site url}
+        externalLinks{site url type}}}"""
+    try:
+        extra = (await anilist(bot.session, q, {"id": int(mid)})).get("Media") or {}
+        if extra:
+            _cache_anilist_episodios[int(mid)] = (time.monotonic(), extra)
+        return {**media, **extra}
+    except Exception as e:
+        print("Consulta de links específicos do AniList falhou:", type(e).__name__)
+        return media
+
+
+def fontes_catalogo_anime(media: dict) -> list[dict]:
+    """Bases adicionais apenas quando existe URL/identificador real."""
+    resultados = []
+    mal_id = media.get("idMal")
+    if isinstance(mal_id, int) and mal_id > 0:
+        resultados.append({"nome": "MyAnimeList", "url": f"https://myanimelist.net/anime/{mal_id}"})
+    nomes = (("LiveChart", "livechart"), ("Kitsu", "kitsu"),
+             ("IMDb", "imdb"), ("TV Time", "tvtime"),
+             ("MyAnimeList", "myanimelist"))
+    for item in media.get("externalLinks") or []:
+        origem = str(item.get("site") or "").lower().replace(" ", "")
+        link = url_legal_externa(item.get("url"))
+        if not link:
+            continue
+        for nome_base, trecho in nomes:
+            if trecho in origem and not any(x["nome"] == nome_base for x in resultados):
+                resultados.append({"nome": nome_base, "url": link})
+                break
+    return resultados
+
+
 def links_de_streaming(media: dict) -> list[dict]:
     """Prefere as plataformas que você assina; se não houver, mostra as demais legais."""
-    todos = [l for l in media["externalLinks"] if l["type"] == "STREAMING"]
+    todos = [l for l in (media.get("externalLinks") or []) if l.get("type") == "STREAMING"]
     meus = [l for l in todos if any(re.search(p, l["site"].lower()) for p in PLATAFORMAS)]
     return (meus or todos)[:5]
 
@@ -1799,33 +1956,61 @@ def montar_aviso(ep: dict, modo: str):
     return emb, links
 
 
-def kw_aviso(emb: discord.Embed, links: list[dict], com_botoes: bool) -> dict:
-    """Inclui botões oficiais de streaming do AniList e busca segura como alternativa."""
+def kw_aviso(emb: discord.Embed, links: list[dict], com_botoes: bool,
+             episodio_oficial: Optional[dict] = None,
+             fontes: Optional[list[dict]] = None) -> dict:
+    """Um botão específico só existe se AniList fornecer URL do episódio EXATO."""
     kwargs = {"embed": emb}
-    if com_botoes:
-        view = discord.ui.View(timeout=None)
-        for l in links[:4]:
-            url = l.get("url")
-            if isinstance(url, str) and url.startswith(("https://", "http://")):
-                site = str(l.get("site") or "streaming")
-                view.add_item(discord.ui.Button(label=f"Assistir na {site}"[:80], url=url))
-        # O botão AniList abre a página oficial com detalhes e links de distribuição.
-        if emb.url and str(emb.url).startswith(("https://", "http://")):
-            view.add_item(discord.ui.Button(label="Ver no AniList", url=emb.url))
-        # Evita sugerir link de reprodução inexistente: é apenas uma pesquisa.
-        if not links:
-            titulo = (emb.title or "Anime").replace("🧪 TESTE — ", "").replace("📺 ", "")
-            titulo = titulo.rsplit(" — Episódio ", 1)[0]
-            view.add_item(discord.ui.Button(label="Buscar onde assistir", url=
-                "https://www.google.com/search?q=" + quote_plus(f"{titulo} onde assistir legalmente Brasil")))
-        kwargs["view"] = view
-    return kwargs
+    if not com_botoes:
+        return kwargs
+    view = discord.ui.View(timeout=None)
+    urls = set()
 
+    def botao(rotulo: str, url: Optional[str]):
+        url = url_legal_externa(url)
+        if not url or url in urls or len(view.children) >= 5:
+            return
+        urls.add(url)
+        view.add_item(discord.ui.Button(label=rotulo[:80], url=url))
+
+    if episodio_oficial:
+        botao("▶️ Assistir episódio mais recente", episodio_oficial.get("url"))
+    # Os links externalLinks são geralmente da OBRA, não de um episódio específico.
+    for link in links[:3]:
+        botao("Ver na " + str(link.get("site") or "plataforma"), link.get("url"))
+        if len(view.children) >= 3:
+            break
+    # Bases extras com identificadores confirmados; não prometem reprodução.
+    for fonte in (fontes or [])[:4]:
+        if len(view.children) >= 4:
+            break
+        botao("Consultar " + fonte["nome"], fonte.get("url"))
+    botao("Ver no AniList", emb.url)
+    if not view.children:
+        titulo = (emb.title or "Anime").replace("🧪 TESTE — ", "").replace("📺 ", "")
+        titulo = titulo.rsplit(" — Episódio ", 1)[0]
+        botao("Buscar onde assistir", "https://www.google.com/search?q=" +
+              quote_plus(f"{titulo} onde assistir legalmente Brasil"))
+    kwargs["view"] = view
+    return kwargs
 
 async def enviar(ep: dict, lembrete: bool):
     m = ep["media"]
     emb, links = montar_aviso(ep, "lembrete" if lembrete else "lancamento")
     botoes = not lembrete
+    episodio_oficial, fontes = None, []
+    if botoes:
+        midia = await enriquecer_midia_anilist(m)
+        episodio_oficial = encontrar_streaming_episodio(midia, int(ep.get("episode") or 0))
+        fontes = fontes_catalogo_anime(midia)
+        if episodio_oficial:
+            emb.add_field(name="▶️ Link do episódio", value=(
+                f"Encontrado em **{discord.utils.escape_markdown(episodio_oficial['site'])}**. "
+                "Use o botão de reprodução abaixo."), inline=False)
+        else:
+            emb.add_field(name="▶️ Link do episódio", value=(
+                "O AniList não informou um link direto para este episódio. "
+                "Use os botões de consulta e plataformas."), inline=False)
 
     canais: dict[int, set[int]] = {}
     dms: set[int] = set()
@@ -1847,14 +2032,14 @@ async def enviar(ep: dict, lembrete: bool):
         try:
             await canal_obj.send(" ".join(f"<@{u}>" for u in donos),
                                  allowed_mentions=discord.AllowedMentions(users=True),
-                                 **kw_aviso(emb, links, botoes))
+                                 **kw_aviso(emb, links, botoes, episodio_oficial, fontes))
         except discord.HTTPException as e:
             print(f"Falha ao avisar no canal {cid}: {e}")
 
     for uid in dms:
         try:
             user = await bot.fetch_user(uid)
-            await user.send(**kw_aviso(emb, links, botoes))
+            await user.send(**kw_aviso(emb, links, botoes, episodio_oficial, fontes))
         except discord.HTTPException as e:
             print(f"Falha ao enviar DM para {uid}: {e}")
 
@@ -2101,13 +2286,25 @@ async def montar_teste_registro(registro: dict, episodios: Optional[list] = None
     emb = aviso_teste_conteudo(registro["titulo"], registro["tipo"],
             registro["plataforma"], registro["origem"], registro["mid"],
             ep, registro.get("poster"))
+    fontes = await buscar_fontes_catalogo(registro["origem"], registro["mid"], registro["tipo"])
     return {"embed": emb, "view": botoes_streaming_conteudo(registro["titulo"],
-            registro["tipo"], registro["plataforma"], registro["origem"], registro["mid"])}
+            registro["tipo"], registro["plataforma"], registro["origem"],
+            registro["mid"], fontes)}
 
 
-def montar_teste_anime(ep: dict) -> dict:
+async def montar_teste_anime(ep: dict) -> dict:
     emb, links = montar_aviso(ep, "teste")
-    return kw_aviso(emb, links, True)
+    midia = await enriquecer_midia_anilist(ep["media"])
+    episodio_oficial = encontrar_streaming_episodio(midia, int(ep.get("episode") or 0))
+    if episodio_oficial:
+        emb.add_field(name="▶️ Link do episódio", value=(
+            f"Encontrado em **{discord.utils.escape_markdown(episodio_oficial['site'])}**. "
+            "Use o botão de reprodução abaixo."), inline=False)
+    else:
+        emb.add_field(name="▶️ Link do episódio", value=(
+            "Não foi encontrado link direto oficial deste episódio nas fontes consultadas. "
+            "Os demais botões levam a páginas de catálogo ou de busca."), inline=False)
+    return kw_aviso(emb, links, True, episodio_oficial, fontes_catalogo_anime(midia))
 
 
 async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int] = None,
@@ -2119,7 +2316,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
             return None
         if selecionado.startswith("f:"):
             ep = await ultimo_episodio(int(selecionado[2:]))
-            return montar_teste_anime(ep) if ep else None
+            return await montar_teste_anime(ep) if ep else None
         reg = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
             FROM conteudos_seguidos WHERE user_id=? AND id=?""",
             (usuario_id, int(selecionado[2:]))).fetchone()
@@ -2142,7 +2339,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
         try:
             ep = await anime_recente_global()
             if ep:
-                return montar_teste_anime(ep)
+                return await montar_teste_anime(ep)
         except Exception as e:
             print("Falha ao buscar anime recente global:", type(e).__name__, e)
         melhor = None
@@ -2154,7 +2351,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
                     melhor = ep
             except Exception as e:
                 print("Falha ao consultar anime seguido para teste:", type(e).__name__, e)
-        return montar_teste_anime(melhor) if melhor else None
+        return await montar_teste_anime(melhor) if melhor else None
 
     melhor = None
     rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
