@@ -1006,7 +1006,9 @@ def embed_conteudo(titulo: str, tipo: str, plataforma: str, origem: str, mid: in
         if ep.get("nome"):
             desc += f" · {discord.utils.escape_markdown(ep['nome'])[:90]}"
         desc += "\n"
-    desc += f"🎞️ Categoria: **{tipo}**\n📺 Plataforma informada pelo membro: **{plataforma}**"
+        if ep.get("total_lancados") is not None:
+            desc += f"📊 **Total de episódios já lançados: {ep['total_lancados']}**\n"
+    desc += f"🎞️ Categoria: **{tipo}**\n📺 Plataforma indicada: **{plataforma}**"
     url = (f"https://www.themoviedb.org/{'movie' if filme else 'tv'}/{mid}"
            if origem == "tmdb" else f"https://www.tvmaze.com/shows/{mid}")
     emb = discord.Embed(title=tit[:250], url=url, description=desc[:4000], color=0x5865F2)
@@ -1164,10 +1166,17 @@ async def checar_conteudos():
     for (origem, mid, maze, _), rows in grupos.items():
         try:
             lancamentos = await buscar_lancamentos(origem, mid, maze, rows[0][2])
+            total_carregado, total_lancados = False, None
             for ep in lancamentos:
                 # Os alertas de filmes referem-se à estreia cadastrada no TMDB,
                 # não necessariamente à data de entrada em Netflix/Prime etc.
                 if ep["quando"] and desde <= ep["quando"] <= agora:
+                    if not total_carregado and rows[0][2] not in TIPOS_FILME:
+                        total_lancados = await total_episodios_exibidos(
+                            origem, mid, maze, rows[0][2], lancamentos)
+                        total_carregado = True
+                    if total_lancados is not None:
+                        ep = {**ep, "total_lancados": total_lancados}
                     await despachar_lancamento(origem, mid, ep, rows)
         except Exception as e:
             erros += 1
@@ -1182,32 +1191,33 @@ async def esperar_conteudos():
     await bot.wait_until_ready()
 
 
-@bot.tree.command(name="testar_conteudo", description="Testa o último episódio/estreia de um título da sua lista")
+@bot.tree.command(name="testar_conteudo", description="Testa o último episódio/estreia de /seguir_conteudo")
 @app_commands.guild_only()
-@app_commands.describe(numero="Número mostrado em /meus_conteudos", canal="Canal que receberá o teste (opcional)")
+@app_commands.describe(numero="Número mostrado em /meus_conteudos", canal="Canal do teste (opcional)")
 async def testar_conteudo(inter: discord.Interaction, numero: app_commands.Range[int, 1, 100000],
                           canal: Optional[discord.TextChannel] = None):
-    rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
-                         FROM conteudos_seguidos WHERE user_id=? ORDER BY id""",
+    rows = db.execute("SELECT id,titulo,tipo FROM conteudos_seguidos WHERE user_id=? ORDER BY id",
                       (inter.user.id,)).fetchall()
     if numero > len(rows):
         return await inter.response.send_message("Número inválido. Veja `/meus_conteudos`.", ephemeral=True)
-    titulo, tipo, plat, origem, mid, maze, poster = rows[numero-1]
-    if not origem or not mid:
-        return await inter.response.send_message("Recadastre este conteúdo em `/seguir_conteudo`.", ephemeral=True)
+    ident, titulo, tipo = rows[numero-1]
     destino = canal or inter.channel
     erro = await validar_canal_teste(inter, destino)
     if erro:
         return await inter.response.send_message("⚠️ " + erro, ephemeral=True)
     await inter.response.defer(ephemeral=True)
     try:
-        enviou = await enviar_teste_conteudo(destino, titulo, tipo, plat, origem, mid, maze, poster)
+        aviso = await preparar_teste(inter.user.id, tipo, selecionado=f"c:{ident}")
+        if aviso is None:
+            return await inter.followup.send("Não encontrei episódio/estreia lançado para este título. "
+                                             "Se for cadastro antigo, refaça em `/seguir_conteudo`.", ephemeral=True)
+        await destino.send(content=f"<@{inter.user.id}>",
+                           allowed_mentions=discord.AllowedMentions(users=True), **aviso)
     except Exception as e:
         print("Erro no teste de conteúdo:", type(e).__name__, e)
-        return await inter.followup.send(f"⚠️ Não consegui consultar ou enviar o teste ({type(e).__name__}).", ephemeral=True)
-    if not enviou:
-        return await inter.followup.send("Não há episódios/estreias **já lançados** com data registrada para este título.", ephemeral=True)
-    await inter.followup.send(f"✅ Teste de **{tipo}** enviado em {destino.mention}, com os botões de streaming.", ephemeral=True)
+        return await inter.followup.send(f"⚠️ Não consegui enviar o teste ({type(e).__name__}).", ephemeral=True)
+    await inter.followup.send(f"✅ Teste de **{tipo}** de **{discord.utils.escape_markdown(titulo)}** "
+                              f"enviado em {destino.mention}, com os botões.", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1783,6 +1793,9 @@ def montar_aviso(ep: dict, modo: str):
 
     emb = discord.Embed(title=titulo, url=m["siteUrl"], description=desc, color=cor)
     emb.set_thumbnail(url=m["coverImage"]["large"])
+    if modo != "lembrete" and (ep.get("episode") or 0) > 0:
+        emb.add_field(name="📊 Episódios lançados nesta temporada",
+                      value=str(ep["episode"]), inline=False)
     return emb, links
 
 
@@ -1851,7 +1864,7 @@ async def enviar(ep: dict, lembrete: bool):
 # O aviso de teste não marca um lançamento real como entregue.
 # ---------------------------------------------------------------------------
 # Apenas testes: não altera as inscrições ou os registros de alertas reais.
-JANELA_TESTE_DIAS = 7
+JANELA_TESTE_DIAS = 7  # Prioridade para testes, não uma restrição obrigatória
 
 
 async def ultimo_episodio(media_id: int) -> Optional[dict]:
@@ -1867,100 +1880,317 @@ async def ultimo_episodio(media_id: int) -> Optional[dict]:
 
 
 async def anime_recente_global() -> Optional[dict]:
-    """Obtém episódio recente diretamente do AniList, sem exigir /seguir."""
-    now = int(time.time())
-    # Busca primeiro nas últimas 48 horas, depois amplia para 7 dias.
-    q = """query($now:Int,$from:Int){Page(perPage:50){
-        airingSchedules(airingAt_lesser:$now,airingAt_greater:$from,sort:TIME_DESC){
+    """Localiza episódio já exibido de anime diretamente no AniList, sem precisar seguir."""
+    agora = int(time.time())
+    # Busca o último episódio conhecido; a janela de 7 dias não bloqueia o teste.
+    q = """query($agora:Int,$inicio:Int){Page(perPage:30){
+        airingSchedules(airingAt_lesser:$agora,airingAt_greater:$inicio,sort:TIME_DESC){
             episode airingAt
             media{id type isAdult title{romaji english} siteUrl coverImage{large}
                   externalLinks{site url type}}}}}"""
-    for dias in (2, JANELA_TESTE_DIAS):
-        data = await anilist(bot.session, q, {"now": now, "from": now - dias * 86400})
-        episodios = []
-        for ep in data["Page"]["airingSchedules"]:
-            media = ep.get("media") or {}
-            if media.get("type") == "ANIME" and not media.get("isAdult") and (ep.get("episode") or 0) > 0:
-                episodios.append(ep)
-        if episodios:
-            # Prefere o lançamento mais recente que tenha ao menos um link oficial
-            # de streaming, para que o teste mostre botões reais quando possível.
-            com_streaming = [ep for ep in episodios if any(
-                l.get("type") == "STREAMING" and l.get("url", "").startswith("https://")
-                for l in (ep["media"].get("externalLinks") or []))]
-            return max(com_streaming or episodios, key=lambda ep: ep["airingAt"])
+    erros = []
+    for dias in (2, 7, 30, 90):
+        try:
+            resposta = await anilist(bot.session, q, {"agora": agora, "inicio": agora - dias * 86400})
+            opcoes = [x for x in (resposta.get("Page") or {}).get("airingSchedules", [])
+                      if x.get("media") and x["media"].get("type") == "ANIME"
+                      and not x["media"].get("isAdult") and (x.get("episode") or 0) > 0
+                      and x.get("airingAt") and x["airingAt"] <= agora]
+            if opcoes:
+                # Prefere links de streaming; mantém episódio real e já exibido.
+                com_links = [x for x in opcoes if any(
+                    l.get("type") == "STREAMING" and str(l.get("url", "")).startswith("https://")
+                    for l in (x["media"].get("externalLinks") or []))]
+                return max(com_links or opcoes, key=lambda x: x["airingAt"])
+        except Exception as e:
+            erros.append(f"{type(e).__name__}: {e}")
+            break  # Erro de API não é ausência de episódio.
+    if erros:
+        print("AniList indisponível no teste global:", erros[0])
     return None
 
 
-async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int] = None):
-    """Monta aviso de teste com episódio recente real e botões; não registra entrega."""
+def episodio_tvmaze_valido(item: dict, categoria: str) -> Optional[dict]:
+    """Filtra programação pública por categoria sem fingir que uma obra é outra."""
+    show = item.get("show") or {}
+    titulo = show.get("name")
+    sid = show.get("id")
+    if not titulo or not sid or not item.get("number"):
+        return None
+    tipo_show = str(show.get("type") or "").lower()
+    generos = [str(g).lower() for g in show.get("genres") or []]
+    if "animation" in tipo_show or "anime" in generos:
+        return None
+    if categoria == "Reality / programa" and not any(
+        t in tipo_show for t in ("reality", "variety", "game show", "talk show")):
+        return None
+    if categoria == "Série" and any(
+        t in tipo_show for t in ("reality", "variety", "game show", "talk show")):
+        return None
+    stamp = item.get("airstamp")
+    try:
+        quando = (datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(timezone.utc)
+                  if stamp else data_utc(item.get("airdate")))
+    except (ValueError, TypeError):
+        quando = data_utc(item.get("airdate"))
+    if not quando or quando > datetime.now(timezone.utc):
+        return None
+    plataforma = ((show.get("webChannel") or {}).get("name") or
+                  (show.get("network") or {}).get("name") or "Não informada")
+    imagem = (show.get("image") or {}).get("medium")
+    episodio = {"key": ident_ep(item.get("season") or 0, item["number"]),
+                "quando": quando, "numero": item["number"],
+                "temporada": item.get("season") or 0,
+                "nome": item.get("name") or "", "source": "TVmaze"}
+    return {"quando": quando, "titulo": titulo, "tipo": categoria,
+            "plataforma": plataforma, "origem": "tvmaze", "mid": int(sid),
+            "poster": imagem, "ep": episodio}
+
+
+async def exemplo_publico_teste(categoria: str) -> Optional[dict]:
+    """Exemplo público, usado apenas em /teste e /testedm, sem criar acompanhamentos."""
+    hoje = datetime.now(FUSO_BR).date()
+    if categoria in TIPOS_FILME:
+        # TMDB cobre estreias de filmes; filmes não possuem episódios.
+        parametros = {"sort_by": "primary_release_date.desc", "include_adult": "false",
+                      "primary_release_date.lte": hoje.isoformat(),
+                      "primary_release_date.gte": (hoje - timedelta(days=60)).isoformat(),
+                      "page": 1}
+        if categoria == "Filme anime":
+            parametros.update({"with_genres": "16", "with_original_language": "ja"})
+        dados = await tmdb_json("/discover/movie", parametros) or {}
+        for filme in dados.get("results") or []:
+            data = data_utc(filme.get("release_date"))
+            if not data or data > datetime.now(timezone.utc) or not filme.get("id"):
+                continue
+            titulo = filme.get("title") or filme.get("original_title") or "Filme"
+            poster = ("https://image.tmdb.org/t/p/w500" + filme["poster_path"]
+                      if filme.get("poster_path") else None)
+            return {"quando": data, "titulo": titulo, "tipo": categoria,
+                    "plataforma": "A consultar", "origem": "tmdb", "mid": filme["id"],
+                    "poster": poster, "ep": {"key": "ESTREIA", "quando": data,
+                       "numero": None, "temporada": None, "nome": titulo, "source": "TMDB"}}
+        return None
+
+    # São fontes públicas reais: K-drama (KR), dorama (JP) e séries globais via web.
+    # Pode não haver dados para todas as obras; nunca inventa episódios.
+    if categoria == "K-drama":
+        caminho, base = "/schedule", {"country": "KR"}
+    elif categoria == "Dorama":
+        caminho, base = "/schedule", {"country": "JP"}
+    elif categoria in ("Série", "Reality / programa", "Outro"):
+        caminho, base = "/schedule/web", {}
+    else:
+        return None
+    melhor = None
+    for dias in range(7):
+        dia = (hoje - timedelta(days=dias)).isoformat()
+        dados = await api_json(f"{TVMAZE_API}{caminho}", {**base, "date": dia}) or []
+        for item in dados:
+            candidato = episodio_tvmaze_valido(item, categoria)
+            if candidato and (melhor is None or candidato["quando"] > melhor["quando"]):
+                melhor = candidato
+        if melhor:
+            break  # Percorre a data mais recente primeiro; evita consultas desnecessárias.
+        await asyncio.sleep(0.1)
+    return melhor
+
+
+# Itens já cadastrados em /seguir e /seguir_conteudo, sempre limitados
+# ao membro que executa o teste. O identificador é interno, não o título.
+def titulos_seguidos_teste(usuario_id: int, categoria: Optional[str] = None) -> list[dict]:
+    itens = []
+    if categoria is None or categoria == "Anime":
+        for mid, titulo in db.execute(
+            "SELECT media_id,title FROM follows WHERE user_id=? ORDER BY title COLLATE NOCASE",
+            (usuario_id,)).fetchall():
+            itens.append({"ref": f"f:{mid}", "titulo": titulo,
+                          "tipo": "Anime", "via": "/seguir"})
+    query = ("SELECT id,titulo,tipo FROM conteudos_seguidos WHERE user_id=? "
+             + ("AND tipo=? " if categoria else "") + "ORDER BY titulo COLLATE NOCASE")
+    params = (usuario_id, categoria) if categoria else (usuario_id,)
+    for item_id, titulo, tipo in db.execute(query, params).fetchall():
+        itens.append({"ref": f"c:{item_id}", "titulo": titulo,
+                      "tipo": tipo, "via": "/seguir_conteudo"})
+    return sorted(itens, key=lambda x: (x["titulo"].casefold(), x["via"]))
+
+
+def titulo_seguido_ref(usuario_id: int, referencia: str) -> Optional[dict]:
+    if not re.fullmatch(r"[fc]:[0-9]+", referencia or ""):
+        return None
+    prefixo, numero = referencia.split(":", 1)
+    if prefixo == "f":
+        row = db.execute("SELECT media_id,title FROM follows WHERE user_id=? AND media_id=?",
+                         (usuario_id, int(numero))).fetchone()
+        return ({"ref": referencia, "titulo": row[1], "tipo": "Anime", "via": "/seguir"}
+                if row else None)
+    row = db.execute("SELECT id,titulo,tipo FROM conteudos_seguidos WHERE user_id=? AND id=?",
+                     (usuario_id, int(numero))).fetchone()
+    return ({"ref": referencia, "titulo": row[1], "tipo": row[2], "via": "/seguir_conteudo"}
+            if row else None)
+
+
+async def titulos_teste_autocomplete(inter: discord.Interaction, atual: str):
+    """Lista unificada: nomes do /seguir e do /seguir_conteudo."""
+    cat = getattr(inter.namespace, "categoria", None)
+    categoria = getattr(cat, "value", cat) if cat else None
+    if categoria not in TIPOS_ALERTA:
+        categoria = None
+    itens = [x for x in titulos_seguidos_teste(inter.user.id, categoria)
+             if atual.casefold() in x["titulo"].casefold()]
+    return [app_commands.Choice(
+        name=f"{x['titulo'][:71]} · {x['tipo']} ({x['via']})"[:100],
+        value=x["ref"]) for x in itens[:25]]
+
+
+async def conteudos_teste_autocomplete(inter: discord.Interaction, atual: str):
+    """Sugestões do /seguir_conteudo que o membro realmente cadastrou."""
+    cat = getattr(inter.namespace, "categoria", None)
+    categoria = getattr(cat, "value", cat) if cat else None
+    if categoria not in TIPOS_ALERTA:
+        categoria = None
+    itens = [x for x in titulos_seguidos_teste(inter.user.id, categoria)
+             if x["ref"].startswith("c:")
+             and atual.casefold() in x["titulo"].casefold()]
+    return [app_commands.Choice(
+        name=f"{x['titulo'][:76]} ({x['tipo']})"[:100], value=x["ref"][2:])
+            for x in itens[:25]]
+
+
+async def total_episodios_exibidos(origem: str, mid: int, maze: Optional[int],
+                                   tipo: str, ja_coletados: Optional[list] = None) -> Optional[int]:
+    """Contagem de episódios com data de exibição passada, excluindo especiais.
+
+    Para títulos TMDB, consulta todas as temporadas: buscar_lancamentos costuma
+    retornar apenas as últimas e não serve para contar a série inteira.
+    """
+    if tipo in TIPOS_FILME:
+        return None
+    agora = datetime.now(timezone.utc)
+    try:
+        if maze or origem == "tvmaze":
+            eps = await coletar_tv_tvmaze(int(maze or mid))
+        elif origem == "tmdb":
+            dados = await tmdb_json(f"/tv/{mid}") or {}
+            temporadas = [int(t["season_number"]) for t in dados.get("seasons") or []
+                          if isinstance(t.get("season_number"), int) and t["season_number"] > 0]
+            # Limita concorrência para respeitar as APIs e o tempo do Discord.
+            sem = asyncio.Semaphore(4)
+            async def uma_temporada(n):
+                async with sem:
+                    info = await tmdb_json(f"/tv/{mid}/season/{n}") or {}
+                    return [dict(key=ident_ep(n, ep["episode_number"]), quando=data_utc(ep.get("air_date")))
+                            for ep in info.get("episodes") or [] if ep.get("episode_number")]
+            lotes = await asyncio.gather(*(uma_temporada(n) for n in temporadas))
+            eps = [ep for lote in lotes for ep in lote]
+        else:
+            eps = ja_coletados or []
+        return len({e["key"] for e in eps if e.get("quando") and e["quando"] <= agora
+                    and not str(e.get("key", "")).startswith("S00")})
+    except Exception as e:
+        print("Não foi possível contar episódios exibidos:", type(e).__name__, e)
+        return None
+
+
+async def montar_teste_registro(registro: dict, episodios: Optional[list] = None) -> dict:
+    ep = dict(registro["ep"])
+    total = await total_episodios_exibidos(registro["origem"], registro["mid"],
+                 registro.get("maze"), registro["tipo"], episodios)
+    if total is not None:
+        ep["total_lancados"] = total
+    emb = aviso_teste_conteudo(registro["titulo"], registro["tipo"],
+            registro["plataforma"], registro["origem"], registro["mid"],
+            ep, registro.get("poster"))
+    return {"embed": emb, "view": botoes_streaming_conteudo(registro["titulo"],
+            registro["tipo"], registro["plataforma"], registro["origem"], registro["mid"])}
+
+
+def montar_teste_anime(ep: dict) -> dict:
+    emb, links = montar_aviso(ep, "teste")
+    return kw_aviso(emb, links, True)
+
+
+async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int] = None,
+                         selecionado: Optional[str] = None):
+    """Testa título escolhido ou exemplo público; não marca aviso como entregue."""
+    if selecionado:
+        item = titulo_seguido_ref(usuario_id, selecionado)
+        if not item or item["tipo"] != categoria:
+            return None
+        if selecionado.startswith("f:"):
+            ep = await ultimo_episodio(int(selecionado[2:]))
+            return montar_teste_anime(ep) if ep else None
+        reg = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
+            FROM conteudos_seguidos WHERE user_id=? AND id=?""",
+            (usuario_id, int(selecionado[2:]))).fetchone()
+        if not reg or not reg[3] or not reg[4]:
+            return None  # Registros antigos sem identificador precisam ser recadastrados.
+        titulo, tipo, plataforma, origem, mid, maze, poster = reg
+        episodios = await buscar_lancamentos(origem, mid, maze, tipo)
+        agora = datetime.now(timezone.utc)
+        existentes = [e for e in episodios if e.get("quando") and e["quando"] <= agora]
+        if not existentes:
+            return None
+        ep = max(existentes, key=lambda e: e["quando"])
+        return await montar_teste_registro({"titulo": titulo, "tipo": tipo,
+            "plataforma": plataforma, "origem": origem, "mid": mid,
+            "maze": maze, "poster": poster, "ep": ep}, episodios)
+
     if categoria == "Anime":
         if anime_id is not None:
-            # Anime explicitamente escolhido tem prioridade, mesmo que não tenha saído esta semana.
-            ep = await ultimo_episodio(anime_id)
-            if ep:
-                emb, links = montar_aviso(ep, "teste")
-                return kw_aviso(emb, links, True)
-            return None
-
-        # Pega o episódio recente de qualquer anime, mesmo sem título cadastrado.
+            return await preparar_teste(usuario_id, categoria, selecionado=f"f:{anime_id}")
         try:
             ep = await anime_recente_global()
             if ep:
-                emb, links = montar_aviso(ep, "teste")
-                return kw_aviso(emb, links, True)
+                return montar_teste_anime(ep)
         except Exception as e:
             print("Falha ao buscar anime recente global:", type(e).__name__, e)
-
-        # Se o AniList não retornou programação global, tenta animes já seguidos.
-        melhor_anime = None
-        limite = time.time() - JANELA_TESTE_DIAS * 86400
-        ids = [r[0] for r in db.execute(
-            "SELECT DISTINCT media_id FROM follows WHERE user_id=?", (usuario_id,))]
+        melhor = None
+        ids = [r[0] for r in db.execute("SELECT media_id FROM follows WHERE user_id=?", (usuario_id,))]
         for mid in ids:
             try:
                 ep = await ultimo_episodio(mid)
-                if ep and ep["airingAt"] >= limite and (melhor_anime is None or ep["airingAt"] > melhor_anime["airingAt"]):
-                    melhor_anime = ep
+                if ep and (melhor is None or ep["airingAt"] > melhor["airingAt"]):
+                    melhor = ep
             except Exception as e:
                 print("Falha ao consultar anime seguido para teste:", type(e).__name__, e)
-        if melhor_anime:
-            emb, links = montar_aviso(melhor_anime, "teste")
-            return kw_aviso(emb, links, True)
-        return None
+        return montar_teste_anime(melhor) if melhor else None
 
-    # Para séries, doramas e filmes: usa os conteúdos cadastrados na categoria correta.
-    # Rejeita datas muito antigas (como K-drama de agosto testado em outubro).
     melhor = None
     rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
         FROM conteudos_seguidos WHERE user_id=? AND tipo=?
             AND origem IS NOT NULL AND mid IS NOT NULL""", (usuario_id, categoria)).fetchall()
     agora = datetime.now(timezone.utc)
-    limite = agora - timedelta(days=JANELA_TESTE_DIAS)
     for titulo, tipo, plataforma, origem, mid, maze, poster in rows:
         try:
             episodios = await buscar_lancamentos(origem, mid, maze, tipo)
-            recentes = [e for e in episodios if e.get("quando") and limite <= e["quando"] <= agora]
-            if recentes:
-                ultimo = max(recentes, key=lambda e: e["quando"])
-                timestamp = ultimo["quando"].timestamp()
-                if melhor is None or timestamp > melhor[0]:
-                    melhor = (timestamp, (titulo, tipo, plataforma, origem, mid, poster, ultimo))
+            antigos = [e for e in episodios if e.get("quando") and e["quando"] <= agora]
+            if antigos:
+                ep = max(antigos, key=lambda e: e["quando"])
+                registro = {"quando": ep["quando"], "titulo": titulo, "tipo": tipo,
+                            "plataforma": plataforma, "origem": origem, "mid": mid,
+                            "maze": maze, "poster": poster, "ep": ep}
+                if melhor is None or ep["quando"] > melhor["quando"]:
+                    melhor = registro
         except Exception as e:
-            print("Falha ao consultar conteúdo para teste:", type(e).__name__, e)
-    if not melhor:
-        return None
-    titulo, tipo, plataforma, origem, mid, poster, ep = melhor[1]
-    return {"embed": aviso_teste_conteudo(titulo, tipo, plataforma, origem, mid, ep, poster),
-            "view": botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid)}
+            print("Falha ao consultar conteúdo seguido para teste:", type(e).__name__, e)
+    if melhor and melhor["quando"] >= agora - timedelta(days=JANELA_TESTE_DIAS):
+        return await montar_teste_registro(melhor)
+    try:
+        publico = await exemplo_publico_teste(categoria)
+        if publico and (melhor is None or publico["quando"] > melhor["quando"]):
+            melhor = publico
+    except Exception as e:
+        print("Consulta pública de teste falhou:", type(e).__name__, e)
+    return await montar_teste_registro(melhor) if melhor else None
 
 
 class TesteView(discord.ui.View):
     def __init__(self, usuario_id: int, categoria: str, canal_id: int,
-                 media_id: Optional[int] = None):
+                 media_id: Optional[int] = None, selecionado: Optional[str] = None):
         super().__init__(timeout=300)
         self.usuario_id, self.categoria = usuario_id, categoria
-        self.canal_id, self.media_id = canal_id, media_id
+        self.canal_id, self.media_id, self.selecionado = canal_id, media_id, selecionado
         self.enviado = False
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
@@ -1982,13 +2212,15 @@ class TesteView(discord.ui.View):
         self.enviado = True
         await inter.response.defer(ephemeral=True)
         try:
-            aviso = await preparar_teste(self.usuario_id, self.categoria, self.media_id)
+            aviso = await preparar_teste(self.usuario_id, self.categoria,
+                                          self.media_id, self.selecionado)
             if not aviso:
                 self.enviado = False
                 return await inter.followup.send(
-                    "Não encontrei episódio recente nos últimos 7 dias nesta categoria. "
-                    "Para séries e doramas, cadastre títulos com `/seguir_conteudo`.", ephemeral=True)
-            await destino.send(**aviso)
+                    "Não achei um episódio com data registrada para esta categoria. "
+                    "Tente seguir um título com `/seguir_conteudo` ou verifique os logs das APIs na FadeHost.", ephemeral=True)
+            await destino.send(content=f"<@{self.usuario_id}>",
+                               allowed_mentions=discord.AllowedMentions(users=True), **aviso)
             button.disabled = True
             await inter.edit_original_response(view=self)
             await inter.followup.send(f"✅ Teste de **{self.categoria}** enviado em {destino.mention}.", ephemeral=True)
@@ -2000,23 +2232,46 @@ class TesteView(discord.ui.View):
 
 class SeletorCategoriaTeste(discord.ui.Select):
     def __init__(self):
-        super().__init__(placeholder="1. Escolha o tipo de conteúdo", min_values=1, max_values=1,
-             options=[discord.SelectOption(label=t, value=t) for t in TIPOS_ALERTA])
+        super().__init__(placeholder="1. Escolha a categoria", min_values=1, max_values=1,
+             options=[discord.SelectOption(label=t, value=t) for t in TIPOS_ALERTA], row=0)
 
     async def callback(self, inter: discord.Interaction):
         painel = self.view
         painel.categoria = self.values[0]
+        painel.selecionado = None
+        painel.pagina = 0
+        painel.atualizar_titulos()
         await inter.response.edit_message(content=painel.descricao(), view=painel)
 
 
 class SeletorCanalTeste(discord.ui.ChannelSelect):
     def __init__(self):
-        super().__init__(placeholder="2. Escolha um canal (opcional)", min_values=1, max_values=1,
-                         channel_types=[discord.ChannelType.text, discord.ChannelType.news])
+        super().__init__(placeholder="2. Escolha o canal (opcional)", min_values=1, max_values=1,
+                         channel_types=[discord.ChannelType.text, discord.ChannelType.news], row=1)
 
     async def callback(self, inter: discord.Interaction):
         painel = self.view
         painel.canal_id = int(self.values[0].id)
+        await inter.response.edit_message(content=painel.descricao(), view=painel)
+
+
+class SeletorTituloTeste(discord.ui.Select):
+    def __init__(self, itens: list[dict], pagina: int, selecionado: Optional[str]):
+        total_paginas = max(1, (len(itens) + 23) // 24)
+        atual = itens[pagina * 24:pagina * 24 + 24]
+        opcoes = [discord.SelectOption(label="Episódio/estreia automático (exemplo)",
+                                       value="auto", default=not selecionado)]
+        for item in atual:
+            opcoes.append(discord.SelectOption(
+                label=item["titulo"][:100], value=item["ref"],
+                description=f"{item['tipo']} · {item['via']}"[:100],
+                default=item["ref"] == selecionado))
+        super().__init__(placeholder=f"3. Escolha a obra cadastrada (página {pagina+1}/{total_paginas})",
+                         options=opcoes, min_values=1, max_values=1, row=2)
+
+    async def callback(self, inter: discord.Interaction):
+        painel = self.view
+        painel.selecionado = None if self.values[0] == "auto" else self.values[0]
         await inter.response.edit_message(content=painel.descricao(), view=painel)
 
 
@@ -2025,22 +2280,52 @@ class PainelTeste(discord.ui.View):
         super().__init__(timeout=300)
         self.usuario_id, self.canal_id = usuario_id, canal_id
         self.categoria = "Anime"
+        self.selecionado = None
+        self.pagina = 0
         self.add_item(SeletorCategoriaTeste())
         self.add_item(SeletorCanalTeste())
+        self.atualizar_titulos()
+
+    def atualizar_titulos(self):
+        for child in list(self.children):
+            if isinstance(child, SeletorTituloTeste):
+                self.remove_item(child)
+        itens = titulos_seguidos_teste(self.usuario_id, self.categoria)
+        paginas = max(1, (len(itens) + 23) // 24)
+        self.pagina = max(0, min(self.pagina, paginas - 1))
+        self.add_item(SeletorTituloTeste(itens, self.pagina, self.selecionado))
+        self.anterior.disabled = self.pagina == 0
+        self.proxima.disabled = self.pagina >= paginas - 1
 
     def descricao(self):
-        return (f"🧪 **Teste de avisos**\nCategoria: **{self.categoria}**\nCanal: <#{self.canal_id}>\n"
-                "Escolha a categoria e o canal (ou mantenha Anime e o canal atual). "
-                "Clique em **Enviar episódio recente** para publicar o aviso com os botões. "
-                "Para Anime, não precisa cadastrar nenhum título previamente.")
+        titulo = titulo_seguido_ref(self.usuario_id, self.selecionado) if self.selecionado else None
+        escolhido = f"**{discord.utils.escape_markdown(titulo['titulo'])}**" if titulo else "Exemplo automático"
+        return (f"🧪 **Teste de avisos**\nCategoria: **{self.categoria}**\n"
+                f"Canal: <#{self.canal_id}>\nObra: {escolhido}\n\n"
+                "Escolha uma obra que você cadastrou com `/seguir` ou `/seguir_conteudo`. "
+                "Se deixar em automático, o bot procura um lançamento de exemplo. "
+                "O teste mostra o episódio mais recente da obra escolhida, mesmo que seja antigo; "
+                "não cria avisos reais.")
 
-    async def interaction_check(self, inter: discord.Interaction) -> bool:
+    async def interaction_check(self, inter: discord.Interaction):
         if inter.user.id != self.usuario_id:
             await inter.response.send_message("Somente quem abriu este painel pode usá-lo.", ephemeral=True)
             return False
         return True
 
-    @discord.ui.button(label="Enviar episódio recente", emoji="🧪", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Anterior", emoji="◀️", style=discord.ButtonStyle.secondary, row=3)
+    async def anterior(self, inter: discord.Interaction, button: discord.ui.Button):
+        self.pagina = max(0, self.pagina - 1)
+        self.atualizar_titulos()
+        await inter.response.edit_message(content=self.descricao(), view=self)
+
+    @discord.ui.button(label="Próxima", emoji="▶️", style=discord.ButtonStyle.secondary, row=3)
+    async def proxima(self, inter: discord.Interaction, button: discord.ui.Button):
+        self.pagina += 1
+        self.atualizar_titulos()
+        await inter.response.edit_message(content=self.descricao(), view=self)
+
+    @discord.ui.button(label="Enviar aviso de teste", emoji="🧪", style=discord.ButtonStyle.primary, row=4)
     async def preparar(self, inter: discord.Interaction, button: discord.ui.Button):
         destino = inter.guild.get_channel(self.canal_id) if inter.guild else None
         if not destino:
@@ -2050,19 +2335,22 @@ class PainelTeste(discord.ui.View):
             return await inter.response.send_message("⚠️ " + erro, ephemeral=True)
         await inter.response.defer(ephemeral=True)
         try:
-            aviso = await preparar_teste(self.usuario_id, self.categoria)
+            aviso = await preparar_teste(self.usuario_id, self.categoria,
+                                         selecionado=self.selecionado)
             if not aviso:
                 return await inter.followup.send(
-                    "Não encontrei episódios/estreias recentes nos últimos 7 dias nesta categoria. "
-                    "Para séries e doramas, siga títulos em `/seguir_conteudo`. ", ephemeral=True)
-            await destino.send(**aviso)
-            await inter.followup.send(f"✅ Teste de **{self.categoria}** enviado em {destino.mention}, com os botões.", ephemeral=True)
+                    "Não encontrei um episódio/estreia com data para essa obra. "
+                    "Se for um cadastro antigo, refaça em `/seguir_conteudo`.", ephemeral=True)
+            await destino.send(content=f"<@{self.usuario_id}>",
+                allowed_mentions=discord.AllowedMentions(users=True), **aviso)
+            await inter.followup.send(f"✅ Teste de **{self.categoria}** enviado em {destino.mention}, "
+                                      "com imagem, tempo relativo e botões.", ephemeral=True)
         except Exception as e:
             print("Falha no teste de canal:", type(e).__name__, e)
             await inter.followup.send(f"⚠️ Falha ao enviar teste ({type(e).__name__}).", ephemeral=True)
 
 
-@bot.tree.command(name="teste", description="Teste qualquer categoria: selecione categoria e canal com um painel")
+@bot.tree.command(name="teste", description="Escolher categoria, título seguido e canal para testar o aviso")
 @app_commands.guild_only()
 @app_commands.describe(canal="Canal inicial do teste (pode mudar no painel)")
 async def teste(inter: discord.Interaction, canal: Optional[discord.TextChannel] = None):
@@ -2071,31 +2359,55 @@ async def teste(inter: discord.Interaction, canal: Optional[discord.TextChannel]
     await inter.response.send_message(painel.descricao(), view=painel, ephemeral=True)
 
 
-@bot.tree.command(name="testar", description="Testar aviso de anime, dorama, série ou filme (com botões)")
+@bot.tree.command(name="testar", description="Testar títulos de /seguir e /seguir_conteudo com botões")
 @app_commands.guild_only()
-@app_commands.describe(anime="Anime específico de /seguir (opcional)",
-                       categoria="Tipo de conteúdo (se vazio, abre seleção de categorias)",
-                       canal="Canal que receberá o teste (padrão: canal atual)")
+@app_commands.describe(titulo="Selecione um título de /seguir ou /seguir_conteudo",
+                       categoria="Categoria (opcional, filtra os títulos)",
+                       canal="Canal que receberá o teste (padrão: canal atual)",
+                       anime="Campo antigo: anime de /seguir (opcional)",
+                       conteudo="Campo antigo: conteúdo de /seguir_conteudo (opcional)")
 @app_commands.choices(categoria=TIPOS_CONTEUDO)
-@app_commands.autocomplete(anime=seguindo_ac)
-async def testar(inter: discord.Interaction, anime: Optional[str] = None,
+@app_commands.autocomplete(titulo=titulos_teste_autocomplete,
+                            anime=seguindo_ac, conteudo=conteudos_teste_autocomplete)
+async def testar(inter: discord.Interaction, titulo: Optional[str] = None,
                  categoria: Optional[app_commands.Choice[str]] = None,
-                 canal: Optional[discord.TextChannel] = None):
+                 canal: Optional[discord.TextChannel] = None,
+                 anime: Optional[str] = None, conteudo: Optional[str] = None):
     destino = canal or inter.channel
-    if not anime and categoria is None:
+    if sum(bool(item) for item in (titulo, anime, conteudo)) > 1:
+        return await inter.response.send_message("Escolha apenas um título.", ephemeral=True)
+    if not titulo and not anime and not conteudo and categoria is None:
         painel = PainelTeste(inter.user.id, destino.id)
         return await inter.response.send_message(painel.descricao(), view=painel, ephemeral=True)
     tipo = categoria.value if categoria else "Anime"
-    if anime and tipo != "Anime":
-        return await inter.response.send_message("Anime específico exige a categoria Anime.", ephemeral=True)
-    if anime and not anime.isdigit():
-        return await inter.response.send_message("Selecione um anime da lista de sugestões.", ephemeral=True)
+    selecionado = None
+    if titulo:
+        selecionado = titulo
+    elif anime:
+        if not anime.isdigit():
+            return await inter.response.send_message("Escolha um anime das sugestões de /seguir.", ephemeral=True)
+        selecionado = f"f:{anime}"
+    elif conteudo:
+        if not conteudo.isdigit():
+            return await inter.response.send_message("Escolha um título das sugestões de /seguir_conteudo.", ephemeral=True)
+        selecionado = f"c:{conteudo}"
+    if selecionado:
+        item = titulo_seguido_ref(inter.user.id, selecionado)
+        if not item:
+            return await inter.response.send_message("Título não está nos seus acompanhamentos.", ephemeral=True)
+        if categoria and categoria.value != item["tipo"]:
+            return await inter.response.send_message(
+                f"O título selecionado é **{item['tipo']}**. Escolha esta categoria ou deixe em branco.", ephemeral=True)
+        tipo = item["tipo"]
     erro = await validar_canal_teste(inter, destino)
     if erro:
         return await inter.response.send_message("⚠️ " + erro, ephemeral=True)
+    escolhido = titulo_seguido_ref(inter.user.id, selecionado) if selecionado else None
+    texto = (f"🧪 Teste **{tipo}** de **{discord.utils.escape_markdown(escolhido['titulo'])}**"
+             if escolhido else f"🧪 Teste automático de **{tipo}**")
     await inter.response.send_message(
-        f"🧪 Teste de **{tipo}** → {destino.mention}. Clique para enviar o aviso de teste.",
-        view=TesteView(inter.user.id, tipo, destino.id, int(anime) if anime else None), ephemeral=True)
+        f"{texto} → {destino.mention}. Clique para enviar.",
+        view=TesteView(inter.user.id, tipo, destino.id, selecionado=selecionado), ephemeral=True)
 
 
 # Testes DM são independentes dos avisos reais. Não alteram dm_categorias nem alertas_entregues.
@@ -2127,13 +2439,14 @@ async def destinatarios_validos_testedm(guild: discord.Guild, ids: list[int],
 
 
 async def enviar_testedm(guild: discord.Guild, usuario_id: int, ids: list[int],
-                        categoria: str, repetir: bool = False):
+                        categoria: str, repetir: bool = False,
+                        selecionado: Optional[str] = None):
     membros, erros = await destinatarios_validos_testedm(guild, ids, usuario_id, categoria, repetir)
     if not membros:
         return 0, erros or ["Nenhum destinatário válido"]
-    aviso = await preparar_teste(usuario_id, categoria)
+    aviso = await preparar_teste(usuario_id, categoria, selecionado=selecionado)
     if aviso is None:
-        return 0, [f"Sem episódio recente disponível em **{categoria}**. Para séries/doramas, use `/seguir_conteudo`."]
+        return 0, [f"Nenhum episódio/estreia com data disponível em **{categoria}**. Tente `/seguir_conteudo`."]
     sucesso = 0
     for membro in membros:
         # Respeita bloqueio mesmo que alterado enquanto o envio estava em andamento.
@@ -2148,12 +2461,14 @@ async def enviar_testedm(guild: discord.Guild, usuario_id: int, ids: list[int],
     return sucesso, erros
 
 
-async def repetir_testedm(guild: discord.Guild, usuario_id: int, ids: list[int], categoria: str):
+async def repetir_testedm(guild: discord.Guild, usuario_id: int, ids: list[int],
+                           categoria: str, selecionado: Optional[str] = None):
     """Um envio imediato, depois a cada 30 minutos até /pausartestedm ou reinício."""
     try:
         while True:
             try:
-                quantidade, erros = await enviar_testedm(guild, usuario_id, ids, categoria, repetir=True)
+                quantidade, erros = await enviar_testedm(guild, usuario_id, ids, categoria,
+                                                          repetir=True, selecionado=selecionado)
                 print(f"Teste DM repetido por {usuario_id}: {categoria}, enviados={quantidade}, falhas={len(erros)}")
                 if not quantidade:
                     break  # Evita repetir indefinidamente se nenhum DM é possível.
@@ -2177,7 +2492,7 @@ def pausar_testedm(usuario_id: int) -> bool:
 
 class SeletorUsuariosTesteDm(discord.ui.UserSelect):
     def __init__(self):
-        super().__init__(placeholder="1. Selecione até 25 @usuários", min_values=1, max_values=25)
+        super().__init__(placeholder="1. Selecione até 25 @usuários", min_values=1, max_values=25, row=0)
 
     async def callback(self, inter: discord.Interaction):
         painel = self.view
@@ -2188,11 +2503,14 @@ class SeletorUsuariosTesteDm(discord.ui.UserSelect):
 class SeletorCategoriaTesteDm(discord.ui.Select):
     def __init__(self):
         super().__init__(placeholder="2. Selecione a categoria", min_values=1, max_values=1,
-            options=[discord.SelectOption(label=t, value=t) for t in TIPOS_ALERTA])
+            options=[discord.SelectOption(label=t, value=t) for t in TIPOS_ALERTA], row=1)
 
     async def callback(self, inter: discord.Interaction):
         painel = self.view
         painel.categoria = self.values[0]
+        painel.selecionado = None
+        painel.pagina = 0
+        painel.atualizar_titulos()
         await inter.response.edit_message(content=painel.descricao(), view=painel)
 
 
@@ -2202,17 +2520,34 @@ class PainelTesteDm(discord.ui.View):
         self.usuario_id, self.guild = usuario_id, guild
         self.ids = ids or []
         self.categoria = "Anime"
+        self.selecionado = None
+        self.pagina = 0
         self.ultimo_envio = 0.0
         self.add_item(SeletorUsuariosTesteDm())
         self.add_item(SeletorCategoriaTesteDm())
+        self.atualizar_titulos()
+
+    def atualizar_titulos(self):
+        for child in list(self.children):
+            if isinstance(child, SeletorTituloTeste):
+                self.remove_item(child)
+        itens = titulos_seguidos_teste(self.usuario_id, self.categoria)
+        paginas = max(1, (len(itens) + 23) // 24)
+        self.pagina = max(0, min(self.pagina, paginas - 1))
+        self.add_item(SeletorTituloTeste(itens, self.pagina, self.selecionado))
+        self.anterior.disabled = self.pagina == 0
+        self.proxima.disabled = self.pagina >= paginas - 1
 
     def descricao(self):
         usuarios = ", ".join(f"<@{u}>" for u in self.ids) or "nenhum selecionado"
         if len(usuarios) > 900:
             usuarios = usuarios[:900] + "…"
         status = "🟢 ativo" if self.usuario_id in tarefas_testedm and not tarefas_testedm[self.usuario_id].done() else "⏸️ parado"
+        obra = titulo_seguido_ref(self.usuario_id, self.selecionado) if self.selecionado else None
+        nome_obra = discord.utils.escape_markdown(obra["titulo"]) if obra else "Exemplo automático"
         return (f"📩 **Teste de avisos por DM**\n**Destinatários:** {usuarios}\n"
-                f"**Categoria:** {self.categoria}\n**Repetição:** {status}\n\n"
+                f"**Categoria:** {self.categoria}\n**Obra:** {nome_obra}\n"
+                f"**Repetição:** {status}\n\n"
                 "**Enviar teste agora:** uma mensagem com episódio/estreia e botões para cada usuário.\n"
                 "**Repetir a cada 30 min:** envia agora e continua até pausar. "
                 "Para repetir em outros usuários, configure antes o `/dm` dessa categoria.\n"
@@ -2224,7 +2559,19 @@ class PainelTesteDm(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Enviar teste agora", emoji="📨", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Anterior", emoji="◀️", style=discord.ButtonStyle.secondary, row=3)
+    async def anterior(self, inter: discord.Interaction, button: discord.ui.Button):
+        self.pagina = max(0, self.pagina - 1)
+        self.atualizar_titulos()
+        await inter.response.edit_message(content=self.descricao(), view=self)
+
+    @discord.ui.button(label="Próxima", emoji="▶️", style=discord.ButtonStyle.secondary, row=3)
+    async def proxima(self, inter: discord.Interaction, button: discord.ui.Button):
+        self.pagina += 1
+        self.atualizar_titulos()
+        await inter.response.edit_message(content=self.descricao(), view=self)
+
+    @discord.ui.button(label="Enviar teste agora", emoji="📨", style=discord.ButtonStyle.primary, row=4)
     async def enviar_agora(self, inter: discord.Interaction, button: discord.ui.Button):
         if not self.ids:
             return await inter.response.send_message("Selecione um ou vários usuários primeiro.", ephemeral=True)
@@ -2233,7 +2580,8 @@ class PainelTesteDm(discord.ui.View):
         self.ultimo_envio = time.monotonic()
         await inter.response.defer(ephemeral=True)
         try:
-            n, erros = await enviar_testedm(self.guild, self.usuario_id, self.ids, self.categoria)
+            n, erros = await enviar_testedm(self.guild, self.usuario_id, self.ids,
+                                              self.categoria, selecionado=self.selecionado)
             texto = f"📨 Teste de **{self.categoria}** enviado por DM para **{n}** membro(s)."
             if erros:
                 texto += "\n⚠️ " + "\n⚠️ ".join(erros)
@@ -2242,7 +2590,7 @@ class PainelTesteDm(discord.ui.View):
             print("Falha no teste DM:", type(e).__name__, e)
             await inter.followup.send(f"⚠️ Falha ao testar DM ({type(e).__name__}).", ephemeral=True)
 
-    @discord.ui.button(label="Repetir a cada 30 min", emoji="🔁", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Repetir a cada 30 min", emoji="🔁", style=discord.ButtonStyle.secondary, row=4)
     async def iniciar_repeticao(self, inter: discord.Interaction, button: discord.ui.Button):
         if not self.ids:
             return await inter.response.send_message("Selecione um ou vários usuários primeiro.", ephemeral=True)
@@ -2256,21 +2604,23 @@ class PainelTesteDm(discord.ui.View):
                                                       "\n".join(erros)[:1600], ephemeral=True)
         await inter.response.defer(ephemeral=True)
         try:
-            aviso = await preparar_teste(self.usuario_id, self.categoria)
+            aviso = await preparar_teste(self.usuario_id, self.categoria,
+                                          selecionado=self.selecionado)
         except Exception as e:
             print("Falha ao preparar a repetição por DM:", type(e).__name__, e)
             return await inter.followup.send("⚠️ Não foi possível consultar um episódio para o teste.", ephemeral=True)
         if aviso is None:
             return await inter.followup.send("Não encontrei episódio recente em **"
                 + self.categoria + "**. Para séries/doramas, use `/seguir_conteudo`.", ephemeral=True)
-        tarefa = asyncio.create_task(repetir_testedm(self.guild, self.usuario_id, self.ids[:], self.categoria))
+        tarefa = asyncio.create_task(repetir_testedm(self.guild, self.usuario_id, self.ids[:],
+                                                     self.categoria, self.selecionado))
         tarefas_testedm[self.usuario_id] = tarefa
         await inter.edit_original_response(content=self.descricao(), view=self)
         await inter.followup.send("🔁 Repetição iniciada, com primeiro envio agora. "
             "Próximas rodadas: a cada 30 minutos. Para parar, clique **Pausar testes** "
             "ou use `/pausartestedm`.", ephemeral=True)
 
-    @discord.ui.button(label="Pausar testes", emoji="⏸️", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="Pausar testes", emoji="⏸️", style=discord.ButtonStyle.danger, row=4)
     async def pausar(self, inter: discord.Interaction, button: discord.ui.Button):
         pausou = pausar_testedm(self.usuario_id)
         await inter.response.edit_message(content=self.descricao(), view=self)
