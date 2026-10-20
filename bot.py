@@ -10,7 +10,9 @@ import uuid
 import zipfile
 from typing import Optional
 from urllib.parse import quote_plus
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
+import unicodedata
 
 import aiohttp
 import discord
@@ -20,6 +22,15 @@ from discord.ext import tasks
 TOKEN = os.getenv("DISCORD_TOKEN", "COLE_SEU_TOKEN_AQUI")
 ANILIST = "https://graphql.anilist.co"
 DB = "animes.db"
+TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
+TMDB_API = "https://api.themoviedb.org/3"
+TVMAZE_API = "https://api.tvmaze.com"
+FUSO_BR = ZoneInfo("America/Sao_Paulo")
+TIPOS_ALERTA = ("Dorama", "K-drama", "Série", "Filme", "Anime", "Filme anime", "Reality / programa", "Outro")
+TIPOS_TV = {"Dorama", "K-drama", "Série", "Anime", "Reality / programa", "Outro"}
+TIPOS_FILME = {"Filme", "Filme anime"}
+# Limite de recuperação se a hospedagem ficar offline por alguns dias.
+JANELA_ATRASO_DIAS = 5
 
 # Plataformas que você assina. São padrões (regex) comparados com o nome do site no AniList,
 # em minúsculas. Para adicionar outra, inclua um padrão novo na lista.
@@ -55,8 +66,50 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS membros(
         dono_id INTEGER, membro_id INTEGER,
         PRIMARY KEY(dono_id, membro_id));
+    CREATE TABLE IF NOT EXISTS sorteio_estado(
+        guild_id INTEGER PRIMARY KEY, aberto INTEGER NOT NULL DEFAULT 0);
+    CREATE TABLE IF NOT EXISTS sorteio_participantes(
+        guild_id INTEGER, user_id INTEGER, enviado INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(guild_id, user_id));
+    CREATE TABLE IF NOT EXISTS sorteio_nomes(
+        guild_id INTEGER, user_id INTEGER, slot INTEGER, nome TEXT,
+        PRIMARY KEY(guild_id, user_id, slot));
+    CREATE TABLE IF NOT EXISTS conteudos_seguidos(
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
+        titulo TEXT NOT NULL, tipo TEXT NOT NULL, plataforma TEXT NOT NULL,
+        criado_em INTEGER NOT NULL,
+        UNIQUE(user_id, titulo, tipo, plataforma));
     """
 )
+db.commit()
+
+# Migração não destrutiva: preserva biblioteca, sorteios, animes e listas antigas.
+db.executescript("""
+    CREATE TABLE IF NOT EXISTS canais_conteudo(
+        user_id INTEGER NOT NULL, guild_id INTEGER NOT NULL,
+        tipo TEXT NOT NULL, channel_id INTEGER NOT NULL,
+        PRIMARY KEY(user_id, guild_id, tipo, channel_id));
+    CREATE TABLE IF NOT EXISTS dm_categorias(
+        dono_id INTEGER NOT NULL, membro_id INTEGER NOT NULL, tipo TEXT NOT NULL,
+        PRIMARY KEY(dono_id, membro_id, tipo));
+    CREATE TABLE IF NOT EXISTS dm_bloqueios(user_id INTEGER PRIMARY KEY);
+    CREATE TABLE IF NOT EXISTS alertas_entregues(
+        destino TEXT NOT NULL, destino_id INTEGER NOT NULL,
+        origem TEXT NOT NULL, mid INTEGER NOT NULL,
+        episodio TEXT NOT NULL, tipo TEXT NOT NULL,
+        PRIMARY KEY(destino, destino_id, origem, mid, episodio, tipo));
+""")
+colunas = {r[1] for r in db.execute("PRAGMA table_info(conteudos_seguidos)")}
+for coluna, definicao in (
+    ("origem", "TEXT"), ("mid", "INTEGER"), ("tvmaze_id", "INTEGER"),
+    ("poster_url", "TEXT")
+):
+    if coluna not in colunas:
+        db.execute(f"ALTER TABLE conteudos_seguidos ADD COLUMN {coluna} {definicao}")
+# Quem já estava cadastrado no antigo /dm continua recebendo animes.
+db.execute("""INSERT OR IGNORE INTO dm_categorias(dono_id,membro_id,tipo)
+              SELECT dono_id,membro_id,'Anime' FROM membros
+              WHERE membro_id NOT IN (SELECT user_id FROM dm_bloqueios)""")
 db.commit()
 
 
@@ -91,6 +144,7 @@ class Bot(discord.Client):
         await self.tree.sync()
         set_last_check(get_last_check())
         checar.start()
+        checar_conteudos.start()
 
 
 bot = Bot()
@@ -311,10 +365,389 @@ async def remover_varios(inter: discord.Interaction, itens: str):
 
 
 # ---------------------------------------------------------------------------
-# DM: só recebe aviso por mensagem privada quem for adicionado aqui
+# Sorteio comunitário: cada participante cadastra cinco nomes/tickets.
+# O sorteio escolhe um ticket e menciona o membro que o cadastrou.
+# ---------------------------------------------------------------------------
+async def sorteio_aberto(guild_id: int) -> bool:
+    row = db.execute("SELECT aberto FROM sorteio_estado WHERE guild_id=?", (guild_id,)).fetchone()
+    return bool(row and row[0])
+
+
+@bot.tree.command(name="sorteio_abrir", description="Abre um novo sorteio e limpa as inscrições anteriores")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def sorteio_abrir(inter: discord.Interaction):
+    db.execute("DELETE FROM sorteio_nomes WHERE guild_id=?", (inter.guild_id,))
+    db.execute("DELETE FROM sorteio_participantes WHERE guild_id=?", (inter.guild_id,))
+    db.execute("INSERT OR REPLACE INTO sorteio_estado(guild_id, aberto) VALUES(?,1)", (inter.guild_id,))
+    db.commit()
+    await inter.response.send_message(
+        "🎟️ **Novo sorteio aberto!** Use `/sorteio_entrar` para participar e depois "
+        "`/sorteio_nomes` para enviar seus 5 nomes. Um administrador inicia com `/sorteio_iniciar`.")
+
+
+@bot.tree.command(name="sorteio_entrar", description="Inscreve você no sorteio atual")
+@app_commands.guild_only()
+async def sorteio_entrar(inter: discord.Interaction):
+    if not await sorteio_aberto(inter.guild_id):
+        return await inter.response.send_message("Não há sorteio aberto. Peça a um administrador para usar `/sorteio_abrir`.", ephemeral=True)
+    db.execute("INSERT OR IGNORE INTO sorteio_participantes(guild_id,user_id,enviado) VALUES(?,?,0)",
+               (inter.guild_id, inter.user.id))
+    db.commit()
+    await inter.response.send_message(
+        "✅ Você está inscrito! Agora use `/sorteio_nomes` e preencha os cinco campos com seus nomes.", ephemeral=True)
+
+
+@bot.tree.command(name="sorteio_nomes", description="Envia os cinco nomes/tickets da sua participação")
+@app_commands.guild_only()
+@app_commands.describe(nome1="Primeiro nome/ticket", nome2="Segundo nome/ticket", nome3="Terceiro nome/ticket",
+                       nome4="Quarto nome/ticket", nome5="Quinto nome/ticket")
+async def sorteio_nomes(inter: discord.Interaction, nome1: str, nome2: str, nome3: str, nome4: str, nome5: str):
+    if not await sorteio_aberto(inter.guild_id):
+        return await inter.response.send_message("Não há sorteio aberto. Peça a um administrador para usar `/sorteio_abrir`.", ephemeral=True)
+    row = db.execute("SELECT enviado FROM sorteio_participantes WHERE guild_id=? AND user_id=?",
+                     (inter.guild_id, inter.user.id)).fetchone()
+    if not row:
+        return await inter.response.send_message("Primeiro entre no sorteio com `/sorteio_entrar`.", ephemeral=True)
+    if row[0]:
+        return await inter.response.send_message("Você já enviou seus cinco nomes. Não é possível alterar durante este sorteio.", ephemeral=True)
+    nomes = [x.strip() for x in (nome1, nome2, nome3, nome4, nome5)]
+    if any(not x for x in nomes):
+        return await inter.response.send_message("Os cinco nomes precisam estar preenchidos.", ephemeral=True)
+    if any(len(x) > 100 for x in nomes):
+        return await inter.response.send_message("Cada nome pode ter no máximo 100 caracteres.", ephemeral=True)
+    for slot, nome_txt in enumerate(nomes, 1):
+        db.execute("INSERT INTO sorteio_nomes(guild_id,user_id,slot,nome) VALUES(?,?,?,?)",
+                   (inter.guild_id, inter.user.id, slot, nome_txt))
+    db.execute("UPDATE sorteio_participantes SET enviado=1 WHERE guild_id=? AND user_id=?",
+               (inter.guild_id, inter.user.id))
+    db.commit()
+    await inter.response.send_message("✅ Seus 5 nomes foram registrados! Use `/sorteio_status` para conferir o andamento.", ephemeral=True)
+
+
+@bot.tree.command(name="sorteio_status", description="Mostra quem já enviou os cinco nomes para o sorteio")
+@app_commands.guild_only()
+async def sorteio_status(inter: discord.Interaction):
+    if not await sorteio_aberto(inter.guild_id):
+        return await inter.response.send_message("Não há sorteio aberto no momento.", ephemeral=True)
+    rows = db.execute("SELECT user_id,enviado FROM sorteio_participantes WHERE guild_id=? ORDER BY user_id",
+                      (inter.guild_id,)).fetchall()
+    if not rows:
+        return await inter.response.send_message("Ainda não há participantes. Use `/sorteio_entrar` para se inscrever.", ephemeral=True)
+    enviados = sum(1 for _, enviado in rows if enviado)
+    linhas = [f"{'✅' if enviado else '⏳'} <@{uid}> {'enviou os 5 nomes' if enviado else 'ainda não enviou os nomes'}"
+              for uid, enviado in rows]
+    await inter.response.send_message(
+        f"**Participantes completos:** {enviados}/{len(rows)}\n" + "\n".join(linhas),
+        allowed_mentions=discord.AllowedMentions.none(), ephemeral=True)
+
+
+@bot.tree.command(name="sorteio_iniciar", description="Inicia o sorteio quando todos os inscritos completarem os cinco nomes")
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
+async def sorteio_iniciar(inter: discord.Interaction):
+    if not await sorteio_aberto(inter.guild_id):
+        return await inter.response.send_message("Não há sorteio aberto. Use `/sorteio_abrir` primeiro.", ephemeral=True)
+    participantes = db.execute("SELECT user_id,enviado FROM sorteio_participantes WHERE guild_id=?",
+                               (inter.guild_id,)).fetchall()
+    if not participantes:
+        return await inter.response.send_message("Ainda não há participantes inscritos.", ephemeral=True)
+    pendentes = [uid for uid, enviado in participantes if not enviado]
+    if pendentes:
+        return await inter.response.send_message(
+            "⏳ Ainda não posso iniciar. Estes participantes precisam enviar os cinco nomes: " +
+            ", ".join(f"<@{uid}>" for uid in pendentes), ephemeral=True)
+    entradas = db.execute("SELECT user_id,nome FROM sorteio_nomes WHERE guild_id=? ORDER BY user_id,slot",
+                          (inter.guild_id,)).fetchall()
+    if len(entradas) != len(participantes) * 5:
+        return await inter.response.send_message("Os dados do sorteio estão incompletos. Peça aos participantes que confiram o status.", ephemeral=True)
+    import random
+    vencedor_id, nome_sorteado = random.SystemRandom().choice(entradas)
+    db.execute("UPDATE sorteio_estado SET aberto=0 WHERE guild_id=?", (inter.guild_id,))
+    db.commit()
+    await inter.response.send_message(
+        f"🎉 **SORTEIO CONCLUÍDO!**\nNome sorteado: **{discord.utils.escape_markdown(nome_sorteado)}**\n"
+        f"🏆 Vencedor: <@{vencedor_id}>!", allowed_mentions=discord.AllowedMentions(users=True))
+
+
+# ---------------------------------------------------------------------------
+# Catálogo TMDB + TVmaze, acompanhamento por usuário e canais por categoria
+# ---------------------------------------------------------------------------
+TIPOS_CONTEUDO = [app_commands.Choice(name=x, value=x) for x in TIPOS_ALERTA]
+
+
+async def api_json(url: str, params: Optional[dict] = None):
+    """Não repassa credenciais aos logs; propagação de falhas para reprocessar."""
+    async with bot.session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
+        if r.status == 404:
+            return None
+        if r.status == 429:
+            raise RuntimeError("Limite de requisições da API atingido (429)")
+        r.raise_for_status()
+        return await r.json()
+
+
+async def tmdb_json(endpoint: str, extra: Optional[dict] = None):
+    if not TMDB_API_KEY:
+        raise RuntimeError("A chave TMDB_API_KEY não foi configurada na FadeHost.")
+    params = {"api_key": TMDB_API_KEY, "language": "pt-BR"}
+    if extra:
+        params.update(extra)
+    return await api_json(f"{TMDB_API}{endpoint}", params)
+
+
+def normalizar(txt: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", unicodedata.normalize("NFKD", txt.lower()).encode("ascii", "ignore").decode())
+
+
+def kind(tipo: str) -> str:
+    return "movie" if tipo in TIPOS_FILME else "tv"
+
+
+async def encontrar_tvmaze(nome_txt: str, tmdb_id: Optional[int] = None, ano: Optional[str] = None):
+    """Evita associar a outra obra de mesmo nome (prioriza identificador IMDb)."""
+    if tmdb_id:
+        try:
+            ext = await tmdb_json(f"/tv/{tmdb_id}/external_ids")
+            imdb = (ext or {}).get("imdb_id")
+            if imdb:
+                match = await api_json(f"{TVMAZE_API}/lookup/shows", {"imdb": imdb})
+                if match:
+                    return int(match["id"])
+        except Exception as e:
+            print("TVmaze: identificação externa indisponível:", type(e).__name__)
+    try:
+        resultados = await api_json(f"{TVMAZE_API}/search/shows", {"q": nome_txt}) or []
+        for item in resultados[:10]:
+            show = item.get("show") or {}
+            if normalizar(show.get("name") or "") != normalizar(nome_txt):
+                continue
+            estreno = show.get("premiered") or ""
+            if ano and estreno[:4] and abs(int(estreno[:4]) - int(ano[:4])) > 1:
+                continue
+            return int(show["id"])
+    except Exception as e:
+        print("Falha ao buscar TVmaze:", type(e).__name__)
+    return None
+
+
+class ResultadosConteudo(discord.ui.View):
+    """Confirma o título escolhido para não acompanhar um homônimo por engano."""
+    def __init__(self, usuario: int, titulo: str, tipo: str, plataforma: str, resultados: list):
+        super().__init__(timeout=180)
+        self.usuario, self.titulo, self.tipo, self.plataforma = usuario, titulo, tipo, plataforma
+        self.resultados = {f"{k}:{i}": r for i, (k, r) in enumerate(resultados)}
+        opcoes = []
+        for value, (provider, r) in zip(self.resultados, resultados):
+            tit = (r.get("name") or r.get("title") or "Sem título")
+            ano = (r.get("first_air_date") or r.get("release_date") or r.get("premiered") or "????")[:4]
+            opcoes.append(discord.SelectOption(label=f"{tit[:80]} ({ano})", value=value,
+                                                  description="TMDB" if provider == "tmdb" else "TVmaze"))
+        select = discord.ui.Select(placeholder="Escolha a obra correta", options=opcoes, min_values=1, max_values=1)
+        select.callback = self.escolher
+        self.add_item(select)
+
+    async def interaction_check(self, inter: discord.Interaction):
+        if inter.user.id != self.usuario:
+            await inter.response.send_message("Somente quem iniciou pode escolher.", ephemeral=True)
+            return False
+        return True
+
+    async def escolher(self, inter: discord.Interaction):
+        await inter.response.defer(ephemeral=True)
+        valor = inter.data["values"][0]
+        r = self.resultados[valor]
+        provider = valor.split(":", 1)[0]
+        titulo = r.get("name") or r.get("title") or self.titulo
+        mid = int(r["id"])
+        tvmaze_id = mid if provider == "tvmaze" else None
+        img = r.get("image") if provider == "tvmaze" else None
+        poster_url = ((img or {}).get("medium") if isinstance(img, dict) else None) if provider == "tvmaze" else (
+            "https://image.tmdb.org/t/p/w500" + r["poster_path"] if r.get("poster_path") else None)
+        if provider == "tmdb" and self.tipo in TIPOS_TV:
+            tvmaze_id = await encontrar_tvmaze(titulo, mid, r.get("first_air_date"))
+        antigo = db.execute("""SELECT id FROM conteudos_seguidos
+                               WHERE user_id=? AND lower(titulo)=lower(?) AND tipo=?""",
+                            (inter.user.id, titulo, self.tipo)).fetchone()
+        try:
+            if antigo:
+                db.execute("""UPDATE conteudos_seguidos
+                              SET plataforma=?, origem=?, mid=?, tvmaze_id=?, poster_url=? WHERE id=?""",
+                           (self.plataforma, provider, mid, tvmaze_id, poster_url, antigo[0]))
+            else:
+                db.execute("""INSERT INTO conteudos_seguidos
+                   (user_id,titulo,tipo,plataforma,criado_em,origem,mid,tvmaze_id,poster_url)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                   (inter.user.id, titulo, self.tipo, self.plataforma, int(time.time()), provider, mid, tvmaze_id, poster_url))
+            db.commit()
+        except sqlite3.IntegrityError:
+            return await inter.followup.send("Esse título já está na sua lista. Use `/meus_conteudos`.", ephemeral=True)
+        self.stop()
+        await inter.edit_original_response(content="✅ **Acompanhamento ativado!**\n"
+                                           f"**{discord.utils.escape_markdown(titulo)}** · {self.tipo} · {self.plataforma}\n"
+                                           "Escolha os canais em `/canal_conteudo` ou os destinatários em `/dm`.\n"
+                                           "Filmes recebem aviso de **estreia**, não de episódios.", view=None)
+
+
+@bot.tree.command(name="seguir_conteudo", description="Seguir doramas, K-dramas, séries, filmes e animes (TMDB/TVmaze)")
+@app_commands.describe(titulo="Nome da obra", tipo="Categoria", plataforma="Streaming onde você pretende assistir")
+@app_commands.choices(tipo=TIPOS_CONTEUDO)
+async def seguir_conteudo(inter: discord.Interaction, titulo: str, tipo: app_commands.Choice[str], plataforma: str):
+    titulo, plataforma = titulo.strip(), plataforma.strip()
+    if not titulo or not plataforma or len(titulo) > 150 or len(plataforma) > 100:
+        return await inter.response.send_message("Informe título e plataforma válidos (até 150 e 100 caracteres).", ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    resultados = []
+    if TMDB_API_KEY:
+        try:
+            data = await tmdb_json(f"/search/{kind(tipo.value)}", {"query": titulo, "include_adult": "false"})
+            resultados = [("tmdb", x) for x in (data or {}).get("results", [])[:10]]
+        except Exception as e:
+            print("Pesquisa TMDB falhou:", type(e).__name__)
+    if tipo.value in TIPOS_TV and len(resultados) < 5:
+        try:
+            shows = await api_json(f"{TVMAZE_API}/search/shows", {"q": titulo}) or []
+            resultados.extend(("tvmaze", x["show"]) for x in shows[:max(0, 10-len(resultados))] if x.get("show"))
+        except Exception as e:
+            print("Pesquisa TVmaze falhou:", type(e).__name__)
+    if not resultados:
+        detalhe = " Configure TMDB_API_KEY na FadeHost." if not TMDB_API_KEY else ""
+        return await inter.followup.send("Não encontrei esse título nas APIs." + detalhe, ephemeral=True)
+    await inter.followup.send("🔎 **Selecione o título correto** para acompanhar seus lançamentos:",
+                              view=ResultadosConteudo(inter.user.id, titulo, tipo.value, plataforma, resultados[:25]),
+                              ephemeral=True)
+
+
+@bot.tree.command(name="meus_conteudos", description="Lista numerada dos conteúdos que você acompanha")
+async def meus_conteudos(inter: discord.Interaction):
+    rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid
+                         FROM conteudos_seguidos WHERE user_id=? ORDER BY id""",
+                      (inter.user.id,)).fetchall()
+    if not rows:
+        return await inter.response.send_message("Você ainda não acompanha títulos. Use `/seguir_conteudo`.", ephemeral=True)
+    linhas = [f"**{n}.** {discord.utils.escape_markdown(t)} · {tipo} · {plat}"
+              + (" ⚠️ recadastre para ativar os alertas" if not orig or not mid else "")
+              for n, (t, tipo, plat, orig, mid) in enumerate(rows, 1)]
+    await inter.response.send_message("\n".join(linhas)[:1900], ephemeral=True)
+
+
+@bot.tree.command(name="deixar_conteudo", description="Remove um título da sua lista pelo número")
+@app_commands.describe(numero="Número exibido em /meus_conteudos")
+async def deixar_conteudo(inter: discord.Interaction, numero: app_commands.Range[int, 1, 100000]):
+    rows = db.execute("SELECT id,titulo FROM conteudos_seguidos WHERE user_id=? ORDER BY id",
+                      (inter.user.id,)).fetchall()
+    if numero > len(rows):
+        return await inter.response.send_message("Esse número não existe na lista.", ephemeral=True)
+    item_id, titulo = rows[numero - 1]
+    db.execute("DELETE FROM conteudos_seguidos WHERE id=? AND user_id=?", (item_id, inter.user.id))
+    db.commit()
+    await inter.response.send_message(f"🗑️ **{discord.utils.escape_markdown(titulo)}** removido da sua lista.", ephemeral=True)
+
+
+class EscolherCanaisConteudo(discord.ui.View):
+    def __init__(self, usuario: int, tipo: str):
+        super().__init__(timeout=240)
+        self.usuario, self.tipo = usuario, tipo
+        selecionador = discord.ui.ChannelSelect(channel_types=[discord.ChannelType.text, discord.ChannelType.news],
+                    placeholder=f"Canais para {tipo}", min_values=1, max_values=25)
+        selecionador.callback = self.salvar
+        self.add_item(selecionador)
+        self.add_item(LimparCanaisConteudo(usuario, tipo))
+
+    async def interaction_check(self, inter: discord.Interaction):
+        if inter.user.id != self.usuario:
+            await inter.response.send_message("Somente quem iniciou pode alterar estes canais.", ephemeral=True)
+            return False
+        return True
+
+    async def salvar(self, inter: discord.Interaction):
+        canais = inter.data.get("values", [])
+        if not inter.guild:
+            return await inter.response.send_message("Use este comando dentro de um servidor.", ephemeral=True)
+        db.execute("DELETE FROM canais_conteudo WHERE user_id=? AND guild_id=? AND tipo=?",
+                   (inter.user.id, inter.guild_id, self.tipo))
+        falhas = []
+        salvos = []
+        for cid in canais:
+            cid = int(cid)
+            c = inter.guild.get_channel(cid)
+            if not c:
+                try:
+                    c = await inter.guild.fetch_channel(cid)
+                except discord.HTTPException:
+                    c = None
+            if not c or not all((c.permissions_for(inter.guild.me).view_channel,
+                                 c.permissions_for(inter.guild.me).send_messages,
+                                 c.permissions_for(inter.guild.me).embed_links)):
+                falhas.append(f"<#{cid}>")
+                continue
+            salvos.append(cid)
+            db.execute("INSERT OR IGNORE INTO canais_conteudo VALUES(?,?,?,?)",
+                       (inter.user.id, inter.guild_id, self.tipo, cid))
+        db.commit()
+        txt = " ".join(f"<#{int(cid)}>" for cid in salvos) or "nenhum"
+        extra = "\n⚠️ Sem permissões nesses canais: " + ", ".join(falhas) if falhas else ""
+        await inter.response.edit_message(content=f"✅ Canais de **{self.tipo}** configurados: {txt}{extra}", view=None)
+
+
+class LimparCanaisConteudo(discord.ui.Button):
+    def __init__(self, usuario: int, tipo: str):
+        super().__init__(label="Remover canais desta categoria", emoji="🗑️", style=discord.ButtonStyle.danger)
+        self.usuario, self.tipo = usuario, tipo
+
+    async def callback(self, inter: discord.Interaction):
+        db.execute("DELETE FROM canais_conteudo WHERE user_id=? AND guild_id=? AND tipo=?",
+                   (self.usuario, inter.guild_id, self.tipo))
+        db.commit()
+        await inter.response.edit_message(content=f"🗑️ Canais de **{self.tipo}** removidos.", view=None)
+
+
+class EscolherCategoriaCanal(discord.ui.View):
+    def __init__(self, usuario: int):
+        super().__init__(timeout=240)
+        self.usuario = usuario
+        select = discord.ui.Select(placeholder="Selecione a categoria dos avisos",
+                options=[discord.SelectOption(label=t, value=t) for t in TIPOS_ALERTA])
+        select.callback = self.proximo
+        self.add_item(select)
+
+    async def proximo(self, inter: discord.Interaction):
+        if inter.user.id != self.usuario:
+            return await inter.response.send_message("Seleção exclusiva de quem iniciou.", ephemeral=True)
+        tipo = inter.data["values"][0]
+        rows = db.execute("""SELECT channel_id FROM canais_conteudo
+                             WHERE user_id=? AND guild_id=? AND tipo=?""",
+                          (inter.user.id, inter.guild_id, tipo)).fetchall()
+        txt = " ".join(f"<#{cid}>" for (cid,) in rows) or "nenhum"
+        await inter.response.edit_message(content=f"📍 **{tipo}**: canais atuais: {txt}\n"
+                                          "Selecione os canais para substituir essa lista:",
+                                          view=EscolherCanaisConteudo(inter.user.id, tipo))
+
+
+@bot.tree.command(name="canal_conteudo", description="Escolher categoria e canais para receber avisos de lançamentos")
+@app_commands.guild_only()
+async def canal_conteudo(inter: discord.Interaction):
+    await inter.response.send_message("Selecione a categoria que deseja configurar:",
+                                      view=EscolherCategoriaCanal(inter.user.id), ephemeral=True)
+
+
+@bot.tree.command(name="canais_conteudo", description="Ver seus canais de aviso por categoria")
+@app_commands.guild_only()
+async def canais_conteudo(inter: discord.Interaction):
+    rows = db.execute("""SELECT tipo,channel_id FROM canais_conteudo WHERE user_id=? AND guild_id=?
+                         ORDER BY tipo,channel_id""", (inter.user.id, inter.guild_id)).fetchall()
+    if not rows:
+        return await inter.response.send_message("Nenhum canal escolhido. Use `/canal_conteudo`.", ephemeral=True)
+    resp = {}
+    for tipo, cid in rows:
+        resp.setdefault(tipo, []).append(f"<#{cid}>")
+    await inter.response.send_message("\n".join(f"**{t}:** {' '.join(c)}" for t,c in resp.items()), ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# DM por categoria: qualquer membro pode usar; destinatário pode se descadastrar.
 # ---------------------------------------------------------------------------
 def extrair_ids(texto: str) -> list[int]:
-    """Pega @menções (<@123>) e IDs soltos de um texto, sem repetir."""
     ids = [int(x) for x in re.findall(r"<@!?(\d{15,20})>", texto)]
     resto = re.sub(r"<@!?\d+>", " ", texto)
     ids += [int(x) for x in re.findall(r"\b\d{15,20}\b", resto)]
@@ -322,132 +755,381 @@ def extrair_ids(texto: str) -> list[int]:
 
 
 def membros_do_dono(dono_id: int) -> list[int]:
-    return [r[0] for r in db.execute("SELECT membro_id FROM membros WHERE dono_id=? ORDER BY rowid", (dono_id,))]
+    return [r[0] for r in db.execute("""SELECT DISTINCT membro_id FROM dm_categorias
+              WHERE dono_id=? ORDER BY membro_id""", (dono_id,))]
 
 
-async def registrar_membros(dono: discord.abc.User, ids: list[int]) -> tuple[list[str], list[str]]:
+async def registrar_membros(inter: discord.Interaction, ids: list[int], tipos: list[str]):
     ok, falhas = [], []
     for uid in ids:
-        try:
-            user = bot.get_user(uid) or await bot.fetch_user(uid)
-        except discord.HTTPException:
-            falhas.append(f"<@{uid}>: usuário não encontrado")
-            continue
-        if user.bot:
-            falhas.append(f"{user.mention}: bots não recebem DM")
-            continue
-        ja = db.execute("SELECT 1 FROM membros WHERE dono_id=? AND membro_id=?", (dono.id, uid)).fetchone()
-        db.execute("INSERT OR IGNORE INTO membros VALUES(?,?)", (dono.id, uid))
-        if ja:
-            ok.append(f"{user.mention} (já estava na lista)")
+        if db.execute("SELECT 1 FROM dm_bloqueios WHERE user_id=?", (uid,)).fetchone():
+            falhas.append(f"<@{uid}> não permite notificações por DM")
             continue
         try:
-            await user.send(
-                f"👋 **{dono.display_name}** adicionou você para receber avisos de episódios de anime por DM. "
-                "Para parar de receber, use o comando `/sair_dos_avisos` em um servidor onde o bot esteja.")
-            ok.append(user.mention)
+            membro = await inter.guild.fetch_member(uid) if inter.guild else None
         except discord.HTTPException:
-            ok.append(f"{user.mention} ⚠️ adicionado, mas não consegui enviar DM (DMs fechadas ou nenhum servidor em comum com o bot)")
+            membro = None
+        if not membro:
+            falhas.append(f"<@{uid}> não está neste servidor")
+            continue
+        if membro.bot:
+            falhas.append(f"<@{uid}> é um bot")
+            continue
+        db.execute("DELETE FROM dm_categorias WHERE dono_id=? AND membro_id=?", (inter.user.id, uid))
+        for t in tipos:
+            db.execute("INSERT OR IGNORE INTO dm_categorias VALUES(?,?,?)", (inter.user.id, uid, t))
+        # Remove registro antigo, para que não restaure 'Anime' ao reiniciar.
+        db.execute("DELETE FROM membros WHERE dono_id=? AND membro_id=?", (inter.user.id, uid))
+        ok.append(f"<@{uid}> ({', '.join(tipos)})")
+        try:
+            await membro.send(f"🔔 <@{inter.user.id}> configurou avisos de **{', '.join(tipos)}** "
+                              "para você por DM. Use `/sair_dos_avisos` para bloquear novos avisos.",
+                              allowed_mentions=discord.AllowedMentions.none())
+        except discord.HTTPException:
+            falhas.append(f"<@{uid}> configurado, mas a mensagem inicial não chegou (DM fechada)")
     db.commit()
     return ok, falhas
 
 
-def resumo_dm(ok: list[str], falhas: list[str]) -> str:
-    partes = []
-    if ok:
-        partes.append("✅ **Receberão os avisos por DM:**\n" + "\n".join(f"• {x}" for x in ok))
-    if falhas:
-        partes.append("⚠️ **Não consegui:**\n" + "\n".join(f"• {x}" for x in falhas))
-    return "\n\n".join(partes)[:1900] or "Nada a fazer."
+class DmTiposView(discord.ui.View):
+    def __init__(self, usuario: int, ids: list[int]):
+        super().__init__(timeout=240)
+        self.usuario, self.ids = usuario, ids
+        select = discord.ui.Select(placeholder="Selecione uma ou várias categorias de avisos",
+           min_values=1, max_values=len(TIPOS_ALERTA),
+           options=[discord.SelectOption(label=t, value=t) for t in TIPOS_ALERTA])
+        select.callback = self.salvar
+        self.add_item(select)
 
-
-class DmView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=300)
-
-    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Selecione uma ou mais pessoas",
-                       min_values=1, max_values=25)
-    async def escolher(self, inter: discord.Interaction, select: discord.ui.UserSelect):
+    async def salvar(self, inter: discord.Interaction):
+        if inter.user.id != self.usuario:
+            return await inter.response.send_message("Somente quem iniciou pode escolher as categorias.", ephemeral=True)
         await inter.response.defer(ephemeral=True)
-        ok, falhas = await registrar_membros(inter.user, [u.id for u in select.values])
-        await inter.followup.send(resumo_dm(ok, falhas), ephemeral=True)
+        tipos = inter.data["values"]
+        ok, falhas = await registrar_membros(inter, self.ids, tipos)
+        texto = ("✅ **Destinatários e categorias:**\n" + "\n".join(ok) if ok else "")
+        if falhas:
+            texto += "\n⚠️ " + "\n⚠️ ".join(falhas)
+        await inter.edit_original_response(content=texto[:1900], view=None)
 
 
-@bot.tree.command(name="dm", description="Adicionar membros que receberão os avisos por DM")
-@app_commands.describe(membros="Mencione várias pessoas (@fulano @ciclano) ou cole os IDs. Vazio = escolher numa lista")
+class DmUsuariosView(discord.ui.View):
+    def __init__(self, usuario: int):
+        super().__init__(timeout=240)
+        self.usuario = usuario
+        select = discord.ui.UserSelect(placeholder="Escolha quem receberá os avisos",
+                                       min_values=1, max_values=25)
+        select.callback = self.avancar
+        self.add_item(select)
+
+    async def avancar(self, inter: discord.Interaction):
+        if inter.user.id != self.usuario:
+            return await inter.response.send_message("Somente quem iniciou pode selecionar pessoas.", ephemeral=True)
+        ids = [int(i) for i in inter.data.get("values", [])]
+        await inter.response.edit_message(content="Agora escolha **quais categorias** essas pessoas receberão por DM:",
+                                          view=DmTiposView(inter.user.id, ids))
+
+
+@bot.tree.command(name="dm", description="Escolher destinatários e categorias de avisos por DM")
+@app_commands.guild_only()
+@app_commands.describe(membros="Opcional: @pessoas ou IDs; vazio abre o seletor de usuários")
 async def dm(inter: discord.Interaction, membros: Optional[str] = None):
     if not membros:
-        return await inter.response.send_message(
-            "Escolha abaixo quem vai receber os avisos por DM:", view=DmView(), ephemeral=True)
+        return await inter.response.send_message("Selecione os membros que receberão avisos por DM:",
+                                                  view=DmUsuariosView(inter.user.id), ephemeral=True)
     ids = extrair_ids(membros)
-    if not ids:
-        return await inter.response.send_message(
-            "Não encontrei nenhuma menção ou ID. Use @pessoa ou deixe o campo vazio para escolher numa lista.",
-            ephemeral=True)
-    if len(ids) > 25:
-        return await inter.response.send_message("Máximo de 25 pessoas por vez.", ephemeral=True)
-    await inter.response.defer(ephemeral=True)
-    ok, falhas = await registrar_membros(inter.user, ids)
-    await inter.followup.send(resumo_dm(ok, falhas))
+    if not ids or len(ids) > 25:
+        return await inter.response.send_message("Informe de 1 a 25 menções/IDs válidos.", ephemeral=True)
+    await inter.response.send_message("Escolha agora as categorias dos avisos:",
+                                      view=DmTiposView(inter.user.id, ids), ephemeral=True)
 
 
-@bot.tree.command(name="dm_lista", description="Mostra quem recebe os avisos por DM (numerado)")
+@bot.tree.command(name="dm_lista", description="Mostra os destinatários e suas categorias configuradas")
 async def dm_lista(inter: discord.Interaction):
     ids = membros_do_dono(inter.user.id)
     if not ids:
-        return await inter.response.send_message("Ninguém recebe avisos por DM ainda. Use `/dm`.", ephemeral=True)
-    txt = "\n".join(f"**{i}.** <@{u}>" for i, u in enumerate(ids, 1))
-    await inter.response.send_message(txt[:1900], ephemeral=True)
+        return await inter.response.send_message("Você não configurou destinatários ainda. Use `/dm`.", ephemeral=True)
+    linhas = []
+    for n, uid in enumerate(ids, 1):
+        cats = [r[0] for r in db.execute("SELECT tipo FROM dm_categorias WHERE dono_id=? AND membro_id=?",
+                                         (inter.user.id, uid))]
+        linhas.append(f"**{n}.** <@{uid}>: {', '.join(cats)}")
+    await inter.response.send_message("\n".join(linhas)[:1900], ephemeral=True)
 
 
-@bot.tree.command(name="remover_dm", description="Remove pessoas dos avisos por DM (por @menção, ID ou número da /dm_lista)")
-@app_commands.describe(itens="Ex.: @fulano @ciclano, 2, 4-5")
+@bot.tree.command(name="remover_dm", description="Remover destinatários por @, ID ou número da /dm_lista")
+@app_commands.describe(itens="Ex.: @fulano, 2, 4-5")
 async def remover_dm(inter: discord.Interaction, itens: str):
     ids = membros_do_dono(inter.user.id)
     if not ids:
-        return await inter.response.send_message("Ninguém recebe avisos por DM ainda.", ephemeral=True)
-
-    remover: dict[int, None] = {}
-    problemas: list[str] = []
-
-    for uid in extrair_ids(itens):
-        if uid in ids:
-            remover[uid] = None
-        else:
-            problemas.append(f"<@{uid}>: não está na sua lista de DM")
-
+        return await inter.response.send_message("Sua lista de DMs está vazia.", ephemeral=True)
+    remover = {i for i in extrair_ids(itens) if i in ids}
     resto = re.sub(r"<@!?\d+>|\b\d{15,20}\b", " ", itens)
-    resto = re.sub(r"\s*-\s*", "-", resto)
-    for tok in [t for t in re.split(r"[,;\s]+", resto) if t]:
+    for tok in re.split(r"[,;\s]+", resto):
+        if not tok:
+            continue
         faixa = re.fullmatch(r"(\d+)-(\d+)", tok)
         if tok.isdigit() or faixa:
             a, b = sorted((int(faixa[1]), int(faixa[2]))) if faixa else (int(tok), int(tok))
-            if a < 1 or a > len(ids):
-                problemas.append(f"nº {tok}: não existe na lista")
-                continue
-            for n in range(a, min(b, len(ids)) + 1):
-                remover[ids[n - 1]] = None
-        else:
-            problemas.append(f"“{tok}”: não entendi (use @pessoa, ID ou número)")
-
+            for pos in range(max(1, a), min(len(ids), b) + 1):
+                remover.add(ids[pos-1])
     for uid in remover:
+        db.execute("DELETE FROM dm_categorias WHERE dono_id=? AND membro_id=?", (inter.user.id, uid))
         db.execute("DELETE FROM membros WHERE dono_id=? AND membro_id=?", (inter.user.id, uid))
     db.commit()
-
-    partes = []
-    if remover:
-        partes.append("🗑️ **Não receberão mais por DM:**\n" + "\n".join(f"• <@{u}>" for u in remover))
-        partes.append("Os números mudam depois de remover. Use `/dm_lista` para ver a nova lista.")
-    if problemas:
-        partes.append("⚠️ **Não consegui:**\n" + "\n".join(f"• {p}" for p in problemas))
-    await inter.response.send_message("\n\n".join(partes)[:1900], ephemeral=True)
+    await inter.response.send_message("🗑️ Removidos: " + (", ".join(f"<@{u}>" for u in remover) if remover else "nenhum encontrado"), ephemeral=True)
 
 
-@bot.tree.command(name="sair_dos_avisos", description="Para de receber por DM os avisos que outras pessoas configuraram para você")
+@bot.tree.command(name="sair_dos_avisos", description="Bloquear avisos por DM configurados por outras pessoas")
 async def sair_dos_avisos(inter: discord.Interaction):
+    db.execute("DELETE FROM dm_categorias WHERE membro_id=?", (inter.user.id,))
     db.execute("DELETE FROM membros WHERE membro_id=?", (inter.user.id,))
+    db.execute("INSERT OR IGNORE INTO dm_bloqueios VALUES(?)", (inter.user.id,))
     db.commit()
-    await inter.response.send_message("✅ Você não receberá mais avisos por DM configurados por outras pessoas.", ephemeral=True)
+    await inter.response.send_message("🔕 Você não receberá esses avisos por DM e não poderá ser readicionado até usar `/permitir_dm`.", ephemeral=True)
+
+
+@bot.tree.command(name="permitir_dm", description="Permitir que membros configurem avisos por DM para você")
+async def permitir_dm(inter: discord.Interaction):
+    db.execute("DELETE FROM dm_bloqueios WHERE user_id=?", (inter.user.id,))
+    db.commit()
+    await inter.response.send_message("✅ Agora você pode voltar a ser adicionado a listas de avisos por DM.", ephemeral=True)
+
+
+# ---------------------------------------------------------------------------
+# Novos episódios: datas TMDB e TVmaze; avisos de estreia para filmes.
+# ---------------------------------------------------------------------------
+def data_utc(ymd: str) -> Optional[datetime]:
+    try:
+        # Fontes que só trazem dia: anunciar ao meio-dia no fuso do Brasil,
+        # SEM afirmar que este é o horário de publicação no streaming.
+        return datetime.strptime(ymd, "%Y-%m-%d").replace(hour=12, tzinfo=FUSO_BR).astimezone(timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def ident_ep(season: int, numero: int) -> str:
+    return f"S{int(season):02d}E{int(numero):03d}"
+
+
+async def coletar_tv_tmdb(mid: int) -> list[dict]:
+    dados = await tmdb_json(f"/tv/{mid}") or {}
+    temporadas = dados.get("number_of_seasons") or 0
+    ult = (dados.get("last_episode_to_air") or {}).get("season_number")
+    nxt = (dados.get("next_episode_to_air") or {}).get("season_number")
+    targets = {x for v in (ult, nxt, temporadas) if isinstance(v, int)
+               for x in (v-1, v, v+1) if 1 <= x <= temporadas}
+    eps = []
+    for n in sorted(targets):
+        temporada = await tmdb_json(f"/tv/{mid}/season/{n}") or {}
+        for ep in temporada.get("episodes") or []:
+            d = data_utc(ep.get("air_date"))
+            if d and ep.get("episode_number"):
+                eps.append({"key": ident_ep(n, ep["episode_number"]), "quando": d,
+                            "numero": ep["episode_number"], "temporada": n,
+                            "nome": ep.get("name") or "", "source": "TMDB"})
+    return eps
+
+
+async def coletar_tv_tvmaze(mid: int) -> list[dict]:
+    dados = await api_json(f"{TVMAZE_API}/shows/{mid}/episodes") or []
+    eps = []
+    for ep in dados:
+        if not ep.get("number") or not isinstance(ep.get("season"), int):
+            continue
+        try:
+            stamp = ep.get("airstamp")
+            d = datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone(timezone.utc) if stamp else data_utc(ep.get("airdate"))
+        except ValueError:
+            d = data_utc(ep.get("airdate"))
+        if d:
+            eps.append({"key": ident_ep(ep.get("season", 0), ep["number"]), "quando": d,
+                        "numero": ep["number"], "temporada": ep.get("season", 0),
+                        "nome": ep.get("name") or "", "source": "TVmaze"})
+    return eps
+
+
+async def buscar_lancamentos(origem: str, mid: int, tvmaze_id: Optional[int], tipo: str):
+    if tipo in TIPOS_FILME:
+        movie = await tmdb_json(f"/movie/{mid}") or {}
+        d = data_utc(movie.get("release_date"))
+        return ([{"key": "ESTREIA", "quando": d, "numero": None,
+                 "temporada": None, "nome": movie.get("title", ""), "source": "TMDB"}]
+                if d else [])
+    epis = {}
+    # Prioriza o TVmaze quando fornece data e hora. TMDB cobre lacunas.
+    erro_tmdb = None
+    if origem == "tmdb":
+        try:
+            for x in await coletar_tv_tmdb(mid):
+                epis[x["key"]] = x
+        except Exception as e:
+            erro_tmdb = e
+    if tvmaze_id or origem == "tvmaze":
+        try:
+            for x in await coletar_tv_tvmaze(tvmaze_id or mid):
+                epis[x["key"]] = x
+        except Exception:
+            if not epis:
+                raise
+    if erro_tmdb and not epis:
+        raise erro_tmdb
+    return list(epis.values())
+
+
+def registro_ja_entregue(destino: str, ident: int, origem: str, mid: int, ep: str, tipo: str):
+    return db.execute("""SELECT 1 FROM alertas_entregues
+        WHERE destino=? AND destino_id=? AND origem=? AND mid=? AND episodio=? AND tipo=?""",
+        (destino, ident, origem, mid, ep, tipo)).fetchone() is not None
+
+
+def marcar_entregue(destino: str, ident: int, origem: str, mid: int, ep: str, tipo: str):
+    db.execute("INSERT OR IGNORE INTO alertas_entregues VALUES(?,?,?,?,?,?)",
+               (destino, ident, origem, mid, ep, tipo))
+    db.commit()
+
+
+def embed_conteudo(titulo: str, tipo: str, plataforma: str, origem: str, mid: int,
+                   ep: dict, poster_url: Optional[str] = None):
+    filme = tipo in TIPOS_FILME
+    tit = f"🎬 Estreia prevista: {titulo}" if filme else f"📺 Novo episódio previsto: {titulo}"
+    timestamp = int(ep["quando"].timestamp())
+    desc = ("A data pode ser a estreia original e **não confirma disponibilidade** "
+            "na plataforma informada, especialmente no Brasil.\n"
+            f"📅 Data informada: <t:{timestamp}:D>\n")
+    if not filme:
+        desc += f"Temporada **{ep['temporada']}**, episódio **{ep['numero']}**"
+        if ep.get("nome"):
+            desc += f" · {discord.utils.escape_markdown(ep['nome'])[:90]}"
+        desc += "\n"
+    desc += f"🎞️ Categoria: **{tipo}**\n📺 Plataforma informada pelo membro: **{plataforma}**"
+    url = (f"https://www.themoviedb.org/{'movie' if filme else 'tv'}/{mid}"
+           if origem == "tmdb" else f"https://www.tvmaze.com/shows/{mid}")
+    emb = discord.Embed(title=tit[:250], url=url, description=desc[:4000], color=0x5865F2)
+    if poster_url and poster_url.startswith("https://"):
+        emb.set_thumbnail(url=poster_url)
+    emb.set_footer(text=f"Informações: {ep['source']} · Datas sujeitas a alterações")
+    return emb
+
+
+async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
+    # rows: (user_id, titulo, tipo, plataforma, criado_em)
+    agora = datetime.now(timezone.utc)
+    ativos = []
+    for uid, titulo, tipo, plataforma, criado in rows:
+        dt_follow = datetime.fromtimestamp(criado, timezone.utc)
+        # Se o usuário começou a seguir depois do DIA DE LANÇAMENTO, não anunciar retroativamente.
+        if dt_follow.astimezone(FUSO_BR).date() > ep["quando"].astimezone(FUSO_BR).date():
+            continue
+        ativos.append((uid, titulo, tipo, plataforma))
+    if not ativos:
+        return
+    # Envio separado por categoria; não menciona destinatários que não seguem essa categoria.
+    por_tipo = {}
+    for uid, titulo, tipo, plataforma in ativos:
+        por_tipo.setdefault(tipo, []).append((uid, titulo, plataforma))
+    for tipo, assinantes in por_tipo.items():
+        subs_canais = {}
+        subs_dm = set()
+        for uid, titulo, plataforma in assinantes:
+            for (cid,) in db.execute("""SELECT channel_id FROM canais_conteudo
+                        WHERE user_id=? AND tipo=?""", (uid, tipo)):
+                subs_canais.setdefault(cid, set()).add(uid)
+            for (dest,) in db.execute("""SELECT membro_id FROM dm_categorias
+                        WHERE dono_id=? AND tipo=?
+                        AND membro_id NOT IN (SELECT user_id FROM dm_bloqueios)""", (uid, tipo)):
+                subs_dm.add(dest)
+        titulo = assinantes[0][1]
+        plataformas = sorted({v[2] for v in assinantes})
+        plataforma = ", ".join(plataformas)[:180]
+        poster_row = db.execute("""SELECT poster_url FROM conteudos_seguidos
+              WHERE origem=? AND mid=? AND tipo=? AND poster_url IS NOT NULL LIMIT 1""",
+              (origem, mid, tipo)).fetchone()
+        emb = embed_conteudo(titulo, tipo, plataforma, origem, mid, ep,
+                             poster_row[0] if poster_row else None)
+        for cid, pessoas in subs_canais.items():
+            if registro_ja_entregue("canal", cid, origem, mid, ep["key"], tipo):
+                continue
+            c = bot.get_channel(cid)
+            if not c:
+                continue
+            try:
+                await c.send(" ".join(f"<@{u}>" for u in pessoas), embed=emb,
+                             allowed_mentions=discord.AllowedMentions(users=True))
+                marcar_entregue("canal", cid, origem, mid, ep["key"], tipo)
+            except discord.HTTPException as e:
+                print(f"Falha no aviso {tipo} para canal {cid}: {e}")
+        for uid in subs_dm:
+            if registro_ja_entregue("dm", uid, origem, mid, ep["key"], tipo):
+                continue
+            try:
+                target = await bot.fetch_user(uid)
+                await target.send(embed=emb)
+                marcar_entregue("dm", uid, origem, mid, ep["key"], tipo)
+            except discord.HTTPException as e:
+                print(f"Falha no aviso {tipo} para DM {uid}: {e}")
+
+
+@tasks.loop(minutes=30)
+async def checar_conteudos():
+    agora = datetime.now(timezone.utc)
+    desde = agora - timedelta(days=JANELA_ATRASO_DIAS)
+    grupos = {}
+    for uid, titulo, tipo, plataforma, criado, origem, mid, maze in db.execute("""
+      SELECT user_id,titulo,tipo,plataforma,criado_em,origem,mid,tvmaze_id
+      FROM conteudos_seguidos WHERE origem IS NOT NULL AND mid IS NOT NULL"""):
+        grupos.setdefault((origem, mid, maze, kind(tipo)), []).append((uid, titulo, tipo, plataforma, criado))
+    if not grupos:
+        return
+    erros = 0
+    for (origem, mid, maze, _), rows in grupos.items():
+        try:
+            lancamentos = await buscar_lancamentos(origem, mid, maze, rows[0][2])
+            for ep in lancamentos:
+                # Os alertas de filmes referem-se à estreia cadastrada no TMDB,
+                # não necessariamente à data de entrada em Netflix/Prime etc.
+                if ep["quando"] and desde <= ep["quando"] <= agora:
+                    await despachar_lancamento(origem, mid, ep, rows)
+        except Exception as e:
+            erros += 1
+            print(f"Consulta de episódios falhou ({origem} #{mid}): {type(e).__name__}: {e}")
+        await asyncio.sleep(0.5)
+    if erros:
+        print(f"Consultas com erro nesta rodada: {erros} de {len(grupos)}")
+
+
+@checar_conteudos.before_loop
+async def esperar_conteudos():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="testar_conteudo", description="Testa neste canal o aviso de um título da sua lista")
+@app_commands.guild_only()
+@app_commands.describe(numero="Número mostrado em /meus_conteudos")
+async def testar_conteudo(inter: discord.Interaction, numero: app_commands.Range[int, 1, 100000]):
+    rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id
+                         FROM conteudos_seguidos WHERE user_id=? ORDER BY id""",
+                      (inter.user.id,)).fetchall()
+    if numero > len(rows):
+        return await inter.response.send_message("Número inválido. Veja `/meus_conteudos`.", ephemeral=True)
+    titulo, tipo, plat, origem, mid, maze = rows[numero-1]
+    if not mid:
+        return await inter.response.send_message("Recadastre este conteúdo em `/seguir_conteudo`.", ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    try:
+        eps = await buscar_lancamentos(origem, mid, maze, tipo)
+        if not eps:
+            return await inter.followup.send("Não há datas ou episódios cadastrados para esse título.", ephemeral=True)
+        ep = sorted(eps, key=lambda x:x["quando"])[-1]
+        poster_row = db.execute("""SELECT poster_url FROM conteudos_seguidos
+                                   WHERE user_id=? AND origem=? AND mid=? LIMIT 1""",
+                                (inter.user.id, origem, mid)).fetchone()
+        await inter.channel.send(content="🧪 **TESTE DE AVISO**",
+                                 embed=embed_conteudo(titulo, tipo, plat, origem, mid, ep,
+                                                      poster_row[0] if poster_row else None))
+        await inter.followup.send("✅ Mensagem de teste enviada neste canal.", ephemeral=True)
+    except Exception as e:
+        await inter.followup.send(f"Não consegui consultar ou enviar o teste: {type(e).__name__}", ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -522,8 +1204,9 @@ async def banner(inter: discord.Interaction, arquivo: Optional[discord.Attachmen
 
 
 # ---------------------------------------------------------------------------
-# Biblioteca pessoal + leitor (arquivos que VOCÊ adiciona; só o dono do bot usa)
-# O leitor é "efêmero": só você enxerga as páginas, mesmo lendo dentro de um canal.
+# Biblioteca compartilhada + leitor
+# Qualquer membro pode adicionar e ler; o progresso é individual.
+# O leitor é efêmero: só quem abriu a leitura vê as páginas.
 # ---------------------------------------------------------------------------
 try:
     import fitz  # PyMuPDF: opcional, só necessário para ler PDF (adicione `pymupdf` ao requirements.txt)
@@ -653,7 +1336,7 @@ async def entrada_ac(inter: discord.Interaction, atual: str):
             if atual.lower() in a.lower() and a.lower().endswith((".cbz", ".zip", ".pdf"))][:25]
 
 
-@bot.tree.command(name="biblioteca_add", description="Adiciona um mangá seu (CBZ, ZIP ou PDF) à biblioteca de leitura")
+@bot.tree.command(name="biblioteca_add", description="Adiciona um mangá à biblioteca compartilhada (CBZ, ZIP ou PDF)")
 @app_commands.describe(
     titulo="Nome do mangá/volume",
     arquivo="Arquivo .cbz, .zip ou .pdf (vale o limite de upload do Discord)",
@@ -662,11 +1345,12 @@ async def entrada_ac(inter: discord.Interaction, atual: str):
 @app_commands.autocomplete(da_pasta=entrada_ac)
 async def biblioteca_add(inter: discord.Interaction, titulo: str, arquivo: Optional[discord.Attachment] = None,
                          link: Optional[str] = None, da_pasta: Optional[str] = None):
-    if not await so_dono(inter):
-        return
     if sum(bool(x) for x in (arquivo, link, da_pasta)) != 1:
         return await inter.response.send_message(
             "Informe **uma** origem: o anexo `arquivo`, um `link` **ou** `da_pasta`.", ephemeral=True)
+    if da_pasta and not await eh_dono(inter.user):
+        return await inter.response.send_message(
+            "🚫 Apenas o dono do bot pode usar arquivos da pasta de entrada. Envie um anexo ou link direto.", ephemeral=True)
     await inter.response.defer(ephemeral=True)
     caminho = None
     try:
@@ -688,31 +1372,27 @@ async def biblioteca_add(inter: discord.Interaction, titulo: str, arquivo: Optio
     await inter.followup.send(f"✅ **{titulo.strip()[:100]}** adicionado ({total} páginas). Abra com `/ler`.")
 
 
-@bot.tree.command(name="biblioteca", description="Mostra os mangás da sua biblioteca (numerados)")
+@bot.tree.command(name="biblioteca", description="Mostra a biblioteca compartilhada de mangás (numerada)")
 async def biblioteca(inter: discord.Interaction):
-    if not await so_dono(inter):
-        return
-    rows = db.execute("SELECT id, titulo, paginas FROM biblioteca WHERE dono_id=? ORDER BY id", (inter.user.id,)).fetchall()
+    rows = db.execute("SELECT id, titulo, paginas, dono_id FROM biblioteca ORDER BY id").fetchall()
     if not rows:
-        return await inter.response.send_message("Sua biblioteca está vazia. Use `/biblioteca_add`.", ephemeral=True)
+        return await inter.response.send_message("A biblioteca está vazia. Use `/biblioteca_add` para adicionar um mangá.", ephemeral=True)
     prog = dict(db.execute("SELECT manga_id, pagina FROM progresso WHERE user_id=?", (inter.user.id,)).fetchall())
     linhas = []
-    for i, (mid, titulo, total) in enumerate(rows, 1):
-        extra = f" • parou na pág. {prog[mid] + 1}" if mid in prog else ""
-        linhas.append(f"**{i}.** {titulo} — {total} págs{extra}")
+    for i, (mid, titulo, total, uploader_id) in enumerate(rows, 1):
+        extra = f" • você parou na pág. {prog[mid] + 1}" if mid in prog else ""
+        linhas.append(f"**{i}.** {titulo} — {total} págs • enviado por <@{uploader_id}>{extra}")
     await inter.response.send_message("\n".join(linhas)[:1900], ephemeral=True)
 
 
 @bot.tree.command(name="biblioteca_remover", description="Remove mangás da biblioteca por nome, número ou faixa (ex.: 1, 3-5, naruto)")
 @app_commands.describe(itens="Nomes e/ou números da /biblioteca, separados por vírgula")
 async def biblioteca_remover(inter: discord.Interaction, itens: str):
-    if not await so_dono(inter):
-        return
-    rows = db.execute("SELECT id, titulo, caminho FROM biblioteca WHERE dono_id=? ORDER BY id", (inter.user.id,)).fetchall()
+    rows = db.execute("SELECT id, titulo, caminho, dono_id FROM biblioteca ORDER BY id").fetchall()
     if not rows:
-        return await inter.response.send_message("Sua biblioteca já está vazia.", ephemeral=True)
+        return await inter.response.send_message("A biblioteca compartilhada está vazia.", ephemeral=True)
 
-    remover: dict[int, tuple[str, str]] = {}
+    remover: dict[int, tuple[str, str, int]] = {}
     problemas: list[str] = []
     for item in dividir(itens):
         faixa = re.fullmatch(r"(\d+)\s*-\s*(\d+)", item)
@@ -722,18 +1402,26 @@ async def biblioteca_remover(inter: discord.Interaction, itens: str):
                 problemas.append(f"nº {item}: não existe na lista")
                 continue
             for n in range(a, min(b, len(rows)) + 1):
-                remover[rows[n - 1][0]] = (rows[n - 1][1], rows[n - 1][2])
+                row = rows[n - 1]
+                if row[3] == inter.user.id:
+                    remover[row[0]] = (row[1], row[2], row[3])
+                else:
+                    problemas.append(f"“{row[1]}”: só quem enviou esse mangá pode removê-lo.")
         else:
             baixo = item.lower()
             achados = [r for r in rows if r[1].lower() == baixo] or [r for r in rows if baixo in r[1].lower()]
             if len(achados) == 1:
-                remover[achados[0][0]] = (achados[0][1], achados[0][2])
+                row = achados[0]
+                if row[3] == inter.user.id:
+                    remover[row[0]] = (row[1], row[2], row[3])
+                else:
+                    problemas.append(f"“{row[1]}”: só quem enviou esse mangá pode removê-lo.")
             elif not achados:
                 problemas.append(f"“{item}”: não encontrado")
             else:
                 problemas.append(f"“{item}”: bate com mais de um ({', '.join(r[1] for r in achados[:3])}…). Seja mais específico ou use o número")
 
-    for mid, (_, caminho) in remover.items():
+    for mid, (_, caminho, _) in remover.items():
         db.execute("DELETE FROM biblioteca WHERE id=?", (mid,))
         db.execute("DELETE FROM progresso WHERE manga_id=?", (mid,))
         _cache_nomes.pop(caminho, None)
@@ -745,18 +1433,18 @@ async def biblioteca_remover(inter: discord.Interaction, itens: str):
 
     partes = []
     if remover:
-        partes.append("🗑️ **Removidos (arquivo apagado do bot):**\n" + "\n".join(f"• {t}" for t, _ in remover.values()))
+        partes.append("🗑️ **Removidos (arquivo apagado do bot):**\n" + "\n".join(f"• {t}" for t, _, _ in remover.values()))
         partes.append("Os números mudam depois de remover. Use `/biblioteca` para ver a nova lista.")
     if problemas:
         partes.append("⚠️ **Não consegui:**\n" + "\n".join(f"• {p}" for p in problemas))
     await inter.response.send_message("\n\n".join(partes)[:1900], ephemeral=True)
 
 
-def resolver_manga(dono_id: int, texto: str):
-    """Devolve a linha (id, titulo, caminho, paginas) ou uma mensagem de erro (str)."""
-    rows = db.execute("SELECT id, titulo, caminho, paginas FROM biblioteca WHERE dono_id=? ORDER BY id", (dono_id,)).fetchall()
+def resolver_manga(user_id: int, texto: str):
+    """Devolve uma entrada da biblioteca compartilhada ou uma mensagem de erro."""
+    rows = db.execute("SELECT id, titulo, caminho, paginas FROM biblioteca ORDER BY id").fetchall()
     if not rows:
-        return "Sua biblioteca está vazia. Use `/biblioteca_add`."
+        return "A biblioteca está vazia. Use `/biblioteca_add` para adicionar um mangá."
     t = texto.strip()
     if t.startswith("id:") and t[3:].isdigit():
         for r in rows:
@@ -776,9 +1464,7 @@ def resolver_manga(dono_id: int, texto: str):
 
 
 async def biblioteca_ac(inter: discord.Interaction, atual: str):
-    if not await eh_dono(inter.user):
-        return []
-    rows = db.execute("SELECT id, titulo FROM biblioteca WHERE dono_id=? ORDER BY id", (inter.user.id,)).fetchall()
+    rows = db.execute("SELECT id, titulo FROM biblioteca ORDER BY id").fetchall()
     return [app_commands.Choice(name=f"{i}. {t}"[:100], value=f"id:{mid}")
             for i, (mid, t) in enumerate(rows, 1) if atual.lower() in t.lower()][:25]
 
@@ -870,13 +1556,11 @@ class LeitorView(discord.ui.View):
         self.stop()
 
 
-@bot.tree.command(name="ler", description="Abre um mangá da sua biblioteca para ler aqui (só você vê)")
+@bot.tree.command(name="ler", description="Abre um mangá da biblioteca compartilhada (só você vê)")
 @app_commands.describe(manga="Título ou número da /biblioteca",
                        pagina="Página inicial (opcional; sem isso, continua de onde você parou)")
 @app_commands.autocomplete(manga=biblioteca_ac)
 async def ler(inter: discord.Interaction, manga: str, pagina: Optional[int] = None):
-    if not await so_dono(inter):
-        return
     achado = resolver_manga(inter.user.id, manga)
     if isinstance(achado, str):
         return await inter.response.send_message(achado, ephemeral=True)
@@ -1037,12 +1721,17 @@ async def enviar(ep: dict, lembrete: bool):
     emb, links = montar_aviso(ep, "lembrete" if lembrete else "lancamento")
     botoes = not lembrete
 
-    canais: dict[int, set[int]] = {}  # canal -> pessoas a mencionar
-    dms: set[int] = set()             # quem recebe por DM (só quem foi adicionado em /dm)
-    for (dono,) in db.execute("SELECT user_id FROM follows WHERE media_id=?", (m["id"],)).fetchall():
-        for (cid,) in db.execute("SELECT channel_id FROM canais WHERE user_id=?", (dono,)).fetchall():
+    canais: dict[int, set[int]] = {}
+    dms: set[int] = set()
+    for (dono,) in db.execute("SELECT user_id FROM follows WHERE media_id=?", (m["id"],)):
+        dests = db.execute("""SELECT channel_id FROM canais WHERE user_id=?
+                             UNION SELECT channel_id FROM canais_conteudo
+                             WHERE user_id=? AND tipo='Anime'""", (dono, dono)).fetchall()
+        for (cid,) in dests:
             canais.setdefault(cid, set()).add(dono)
-        for (uid,) in db.execute("SELECT membro_id FROM membros WHERE dono_id=?", (dono,)).fetchall():
+        for (uid,) in db.execute("""SELECT membro_id FROM dm_categorias
+                                    WHERE dono_id=? AND tipo='Anime'
+                                    AND membro_id NOT IN (SELECT user_id FROM dm_bloqueios)""", (dono,)):
             dms.add(uid)
 
     for cid, donos in canais.items():
@@ -1050,7 +1739,9 @@ async def enviar(ep: dict, lembrete: bool):
         if not canal_obj:
             continue
         try:
-            await canal_obj.send(" ".join(f"<@{u}>" for u in donos), **kw_aviso(emb, links, botoes))
+            await canal_obj.send(" ".join(f"<@{u}>" for u in donos),
+                                 allowed_mentions=discord.AllowedMentions(users=True),
+                                 **kw_aviso(emb, links, botoes))
         except discord.HTTPException as e:
             print(f"Falha ao avisar no canal {cid}: {e}")
 
