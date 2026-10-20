@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+
 animes.db
 animes.db-journal
 animes.db-wal
@@ -11,7 +14,9 @@ dados/
 *.mobi
 *.pdf
 *.zip
+*.part
 
 __pycache__/
 *.py[cod]
-*.part
+*.log
+.DS_Store
