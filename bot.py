@@ -992,11 +992,15 @@ def marcar_entregue(destino: str, ident: int, origem: str, mid: int, ep: str, ti
 def embed_conteudo(titulo: str, tipo: str, plataforma: str, origem: str, mid: int,
                    ep: dict, poster_url: Optional[str] = None):
     filme = tipo in TIPOS_FILME
-    tit = f"🎬 Estreia prevista: {titulo}" if filme else f"📺 Novo episódio previsto: {titulo}"
+    tit = f"🎬 Estreia registrada: {titulo}" if filme else f"📺 Novo episódio: {titulo}"
     timestamp = int(ep["quando"].timestamp())
-    desc = ("A data pode ser a estreia original e **não confirma disponibilidade** "
-            "na plataforma informada, especialmente no Brasil.\n"
-            f"📅 Data informada: <t:{timestamp}:D>\n")
+    # O Discord renderiza <t:...:R> como "há 4 dias", "há 2 horas" etc.,
+    # e atualiza o texto relativo automaticamente. A data é da API de catálogo,
+    # NÃO necessariamente da disponibilidade no serviço brasileiro.
+    desc = (f"{'🎬 Estreia registrada' if filme else '🆕 Episódio lançado'} "
+            f"<t:{timestamp}:R> (data: <t:{timestamp}:D>).\n"
+            "⚠️ A data informada é a de estreia/exibição cadastrada na fonte e "
+            "**não garante disponibilidade** na plataforma no Brasil.\n")
     if not filme:
         desc += f"Temporada **{ep['temporada']}**, episódio **{ep['numero']}**"
         if ep.get("nome"):
@@ -1771,7 +1775,10 @@ def montar_aviso(ep: dict, modo: str):
         cor = 0x4CAF50
     else:
         titulo = f"📺 {nm} — Episódio {ep['episode']}"
-        desc = "Acabou de ser lançado!"
+        desc = (f"Episódio lançado <t:{ep['airingAt']}:R> "
+                f"(data: <t:{ep['airingAt']}:D>). "
+                "O horário é o de exibição informado pelo AniList; "
+                "a disponibilidade no streaming pode variar.")
         cor = 0xE91E63
 
     emb = discord.Embed(title=titulo, url=m["siteUrl"], description=desc, color=cor)
@@ -1780,17 +1787,24 @@ def montar_aviso(ep: dict, modo: str):
 
 
 def kw_aviso(emb: discord.Embed, links: list[dict], com_botoes: bool) -> dict:
-    """Cria botões oficiais quando existirem; senão, oferece busca de streaming."""
+    """Inclui botões oficiais de streaming do AniList e busca segura como alternativa."""
     kwargs = {"embed": emb}
     if com_botoes:
-        view = discord.ui.View()
-        for l in links[:5]:
-            view.add_item(discord.ui.Button(label=f"Assistir na {l['site']}"[:80], url=l["url"]))
+        view = discord.ui.View(timeout=None)
+        for l in links[:4]:
+            url = l.get("url")
+            if isinstance(url, str) and url.startswith(("https://", "http://")):
+                site = str(l.get("site") or "streaming")
+                view.add_item(discord.ui.Button(label=f"Assistir na {site}"[:80], url=url))
+        # O botão AniList abre a página oficial com detalhes e links de distribuição.
+        if emb.url and str(emb.url).startswith(("https://", "http://")):
+            view.add_item(discord.ui.Button(label="Ver no AniList", url=emb.url))
+        # Evita sugerir link de reprodução inexistente: é apenas uma pesquisa.
         if not links:
-            nome_anime = (emb.title or "Anime").split(" — ")[0]
-            nome_anime = nome_anime.replace("🧪 TESTE", "").replace("📺", "").strip(" —")
+            titulo = (emb.title or "Anime").replace("🧪 TESTE — ", "").replace("📺 ", "")
+            titulo = titulo.rsplit(" — Episódio ", 1)[0]
             view.add_item(discord.ui.Button(label="Buscar onde assistir", url=
-                "https://www.google.com/search?q=" + quote_plus(f"{nome_anime} assistir anime oficialmente")))
+                "https://www.google.com/search?q=" + quote_plus(f"{titulo} onde assistir legalmente Brasil")))
         kwargs["view"] = view
     return kwargs
 
@@ -1836,52 +1850,107 @@ async def enviar(ep: dict, lembrete: bool):
 # /testar: botão para testar qualquer categoria num canal escolhido.
 # O aviso de teste não marca um lançamento real como entregue.
 # ---------------------------------------------------------------------------
+# Apenas testes: não altera as inscrições ou os registros de alertas reais.
+JANELA_TESTE_DIAS = 7
+
+
 async def ultimo_episodio(media_id: int) -> Optional[dict]:
+    """Último episódio já exibido de um anime específico que o usuário selecionou."""
     q = """query($id:Int,$now:Int){Page(perPage:1){
         airingSchedules(mediaId:$id,airingAt_lesser:$now,sort:TIME_DESC){
             episode airingAt
-            media{id title{romaji english} siteUrl coverImage{large}
+            media{id type isAdult title{romaji english} siteUrl coverImage{large}
                   externalLinks{site url type}}}}}"""
     data = await anilist(bot.session, q, {"id": media_id, "now": int(time.time())})
-    lista_ep = data["Page"]["airingSchedules"]
-    return lista_ep[0] if lista_ep else None
+    return next((ep for ep in data["Page"]["airingSchedules"]
+                 if ep.get("media") and not ep["media"].get("isAdult")), None)
+
+
+async def anime_recente_global() -> Optional[dict]:
+    """Obtém episódio recente diretamente do AniList, sem exigir /seguir."""
+    now = int(time.time())
+    # Busca primeiro nas últimas 48 horas, depois amplia para 7 dias.
+    q = """query($now:Int,$from:Int){Page(perPage:50){
+        airingSchedules(airingAt_lesser:$now,airingAt_greater:$from,sort:TIME_DESC){
+            episode airingAt
+            media{id type isAdult title{romaji english} siteUrl coverImage{large}
+                  externalLinks{site url type}}}}}"""
+    for dias in (2, JANELA_TESTE_DIAS):
+        data = await anilist(bot.session, q, {"now": now, "from": now - dias * 86400})
+        episodios = []
+        for ep in data["Page"]["airingSchedules"]:
+            media = ep.get("media") or {}
+            if media.get("type") == "ANIME" and not media.get("isAdult") and (ep.get("episode") or 0) > 0:
+                episodios.append(ep)
+        if episodios:
+            # Prefere o lançamento mais recente que tenha ao menos um link oficial
+            # de streaming, para que o teste mostre botões reais quando possível.
+            com_streaming = [ep for ep in episodios if any(
+                l.get("type") == "STREAMING" and l.get("url", "").startswith("https://")
+                for l in (ep["media"].get("externalLinks") or []))]
+            return max(com_streaming or episodios, key=lambda ep: ep["airingAt"])
+    return None
 
 
 async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int] = None):
-    """Prepara um ÚNICO aviso com o último lançamento da categoria (não marca como entregue)."""
-    melhor = None
+    """Monta aviso de teste com episódio recente real e botões; não registra entrega."""
     if categoria == "Anime":
-        ids = ([anime_id] if anime_id else [r[0] for r in db.execute(
-            "SELECT media_id FROM follows WHERE user_id=?", (usuario_id,))])
+        if anime_id is not None:
+            # Anime explicitamente escolhido tem prioridade, mesmo que não tenha saído esta semana.
+            ep = await ultimo_episodio(anime_id)
+            if ep:
+                emb, links = montar_aviso(ep, "teste")
+                return kw_aviso(emb, links, True)
+            return None
+
+        # Pega o episódio recente de qualquer anime, mesmo sem título cadastrado.
+        try:
+            ep = await anime_recente_global()
+            if ep:
+                emb, links = montar_aviso(ep, "teste")
+                return kw_aviso(emb, links, True)
+        except Exception as e:
+            print("Falha ao buscar anime recente global:", type(e).__name__, e)
+
+        # Se o AniList não retornou programação global, tenta animes já seguidos.
+        melhor_anime = None
+        limite = time.time() - JANELA_TESTE_DIAS * 86400
+        ids = [r[0] for r in db.execute(
+            "SELECT DISTINCT media_id FROM follows WHERE user_id=?", (usuario_id,))]
         for mid in ids:
             try:
                 ep = await ultimo_episodio(mid)
-                if ep and (melhor is None or ep["airingAt"] > melhor[0]):
-                    melhor = (ep["airingAt"], "anime", ep)
+                if ep and ep["airingAt"] >= limite and (melhor_anime is None or ep["airingAt"] > melhor_anime["airingAt"]):
+                    melhor_anime = ep
             except Exception as e:
-                print("Falha ao consultar anime para teste:", type(e).__name__, e)
-    if anime_id is None:
-        rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
-            FROM conteudos_seguidos WHERE user_id=? AND tipo=? AND origem IS NOT NULL AND mid IS NOT NULL""",
-            (usuario_id, categoria)).fetchall()
-        agora = datetime.now(timezone.utc)
-        for titulo, tipo, plataforma, origem, mid, maze, poster in rows:
-            try:
-                episodios = await buscar_lancamentos(origem, mid, maze, tipo)
-                anteriores = [e for e in episodios if e.get("quando") and e["quando"] <= agora]
-                if anteriores:
-                    ultimo = max(anteriores, key=lambda e: e["quando"])
-                    timestamp = ultimo["quando"].timestamp()
-                    if melhor is None or timestamp > melhor[0]:
-                        melhor = (timestamp, "conteudo", (titulo, tipo, plataforma, origem, mid, poster, ultimo))
-            except Exception as e:
-                print("Falha ao consultar conteúdo para teste:", type(e).__name__, e)
+                print("Falha ao consultar anime seguido para teste:", type(e).__name__, e)
+        if melhor_anime:
+            emb, links = montar_aviso(melhor_anime, "teste")
+            return kw_aviso(emb, links, True)
+        return None
+
+    # Para séries, doramas e filmes: usa os conteúdos cadastrados na categoria correta.
+    # Rejeita datas muito antigas (como K-drama de agosto testado em outubro).
+    melhor = None
+    rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
+        FROM conteudos_seguidos WHERE user_id=? AND tipo=?
+            AND origem IS NOT NULL AND mid IS NOT NULL""", (usuario_id, categoria)).fetchall()
+    agora = datetime.now(timezone.utc)
+    limite = agora - timedelta(days=JANELA_TESTE_DIAS)
+    for titulo, tipo, plataforma, origem, mid, maze, poster in rows:
+        try:
+            episodios = await buscar_lancamentos(origem, mid, maze, tipo)
+            recentes = [e for e in episodios if e.get("quando") and limite <= e["quando"] <= agora]
+            if recentes:
+                ultimo = max(recentes, key=lambda e: e["quando"])
+                timestamp = ultimo["quando"].timestamp()
+                if melhor is None or timestamp > melhor[0]:
+                    melhor = (timestamp, (titulo, tipo, plataforma, origem, mid, poster, ultimo))
+        except Exception as e:
+            print("Falha ao consultar conteúdo para teste:", type(e).__name__, e)
     if not melhor:
         return None
-    if melhor[1] == "anime":
-        embed, links = montar_aviso(melhor[2], "teste")
-        return kw_aviso(embed, links, True)
-    titulo, tipo, plataforma, origem, mid, poster, ep = melhor[2]
+    titulo, tipo, plataforma, origem, mid, poster, ep = melhor[1]
     return {"embed": aviso_teste_conteudo(titulo, tipo, plataforma, origem, mid, ep, poster),
             "view": botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid)}
 
@@ -1917,8 +1986,8 @@ class TesteView(discord.ui.View):
             if not aviso:
                 self.enviado = False
                 return await inter.followup.send(
-                    "Não achei um episódio/estreia já lançado nessa categoria. "
-                    "Cadastre títulos com `/seguir` ou `/seguir_conteudo` e tente novamente.", ephemeral=True)
+                    "Não encontrei episódio recente nos últimos 7 dias nesta categoria. "
+                    "Para séries e doramas, cadastre títulos com `/seguir_conteudo`.", ephemeral=True)
             await destino.send(**aviso)
             button.disabled = True
             await inter.edit_original_response(view=self)
@@ -1961,8 +2030,9 @@ class PainelTeste(discord.ui.View):
 
     def descricao(self):
         return (f"🧪 **Teste de avisos**\nCategoria: **{self.categoria}**\nCanal: <#{self.canal_id}>\n"
-                "Escolha as opções acima e clique em **Preparar teste**. "
-                "O próximo botão enviará o último episódio/estreia já lançado com links de streaming ou busca.")
+                "Escolha a categoria e o canal (ou mantenha Anime e o canal atual). "
+                "Clique em **Enviar episódio recente** para publicar o aviso com os botões. "
+                "Para Anime, não precisa cadastrar nenhum título previamente.")
 
     async def interaction_check(self, inter: discord.Interaction) -> bool:
         if inter.user.id != self.usuario_id:
@@ -1970,7 +2040,7 @@ class PainelTeste(discord.ui.View):
             return False
         return True
 
-    @discord.ui.button(label="Preparar teste", emoji="🧪", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="Enviar episódio recente", emoji="🧪", style=discord.ButtonStyle.primary)
     async def preparar(self, inter: discord.Interaction, button: discord.ui.Button):
         destino = inter.guild.get_channel(self.canal_id) if inter.guild else None
         if not destino:
@@ -1978,9 +2048,18 @@ class PainelTeste(discord.ui.View):
         erro = await validar_canal_teste(inter, destino)
         if erro:
             return await inter.response.send_message("⚠️ " + erro, ephemeral=True)
-        await inter.response.edit_message(content=f"🧪 **{self.categoria}** → {destino.mention}\n"
-            "Clique abaixo para enviar o aviso de teste com botões.",
-            view=TesteView(self.usuario_id, self.categoria, self.canal_id))
+        await inter.response.defer(ephemeral=True)
+        try:
+            aviso = await preparar_teste(self.usuario_id, self.categoria)
+            if not aviso:
+                return await inter.followup.send(
+                    "Não encontrei episódios/estreias recentes nos últimos 7 dias nesta categoria. "
+                    "Para séries e doramas, siga títulos em `/seguir_conteudo`. ", ephemeral=True)
+            await destino.send(**aviso)
+            await inter.followup.send(f"✅ Teste de **{self.categoria}** enviado em {destino.mention}, com os botões.", ephemeral=True)
+        except Exception as e:
+            print("Falha no teste de canal:", type(e).__name__, e)
+            await inter.followup.send(f"⚠️ Falha ao enviar teste ({type(e).__name__}).", ephemeral=True)
 
 
 @bot.tree.command(name="teste", description="Teste qualquer categoria: selecione categoria e canal com um painel")
@@ -2054,7 +2133,7 @@ async def enviar_testedm(guild: discord.Guild, usuario_id: int, ids: list[int],
         return 0, erros or ["Nenhum destinatário válido"]
     aviso = await preparar_teste(usuario_id, categoria)
     if aviso is None:
-        return 0, [f"Sem episódio ou estreia já lançada de **{categoria}** na sua lista. Use `/seguir` ou `/seguir_conteudo`."]
+        return 0, [f"Sem episódio recente disponível em **{categoria}**. Para séries/doramas, use `/seguir_conteudo`."]
     sucesso = 0
     for membro in membros:
         # Respeita bloqueio mesmo que alterado enquanto o envio estava em andamento.
@@ -2182,8 +2261,8 @@ class PainelTesteDm(discord.ui.View):
             print("Falha ao preparar a repetição por DM:", type(e).__name__, e)
             return await inter.followup.send("⚠️ Não foi possível consultar um episódio para o teste.", ephemeral=True)
         if aviso is None:
-            return await inter.followup.send("Não encontrei episódio ou estreia já lançada em **"
-                + self.categoria + "**. Cadastre títulos em `/seguir` ou `/seguir_conteudo`.", ephemeral=True)
+            return await inter.followup.send("Não encontrei episódio recente em **"
+                + self.categoria + "**. Para séries/doramas, use `/seguir_conteudo`.", ephemeral=True)
         tarefa = asyncio.create_task(repetir_testedm(self.guild, self.usuario_id, self.ids[:], self.categoria))
         tarefas_testedm[self.usuario_id] = tarefa
         await inter.edit_original_response(content=self.descricao(), view=self)
