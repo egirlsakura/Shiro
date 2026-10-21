@@ -151,7 +151,16 @@ class Bot(discord.Client):
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
-        await self.tree.sync()
+        comandos = await self.tree.sync()
+        print(f"[Shiro] {len(comandos)} comandos globais sincronizados: "
+              + ", ".join(sorted(c.name for c in comandos)))
+        # Opcional: servidor de testes ganha slash commands imediatamente.
+        gid = os.getenv("DISCORD_GUILD_ID", "").strip()
+        if gid.isdigit():
+            guild = discord.Object(id=int(gid))
+            self.tree.copy_global_to(guild=guild)
+            comandos_guild = await self.tree.sync(guild=guild)
+            print(f"[Shiro] {len(comandos_guild)} comandos sincronizados no servidor {gid}.")
         set_last_check(get_last_check())
         checar.start()
         checar_conteudos.start()
@@ -291,31 +300,129 @@ def botoes_links_usuario(view: discord.ui.View, links: list[tuple[int, str]],
         urls.add(valido)
 
 
-@bot.tree.command(name="seguir", description="Seguir um anime para receber aviso de episódios")
-@app_commands.describe(anime="Nome do anime", link="Opcional: link da obra ou temporada",
-                       temporada="Opcional: número da temporada a que pertence o link",
-                       temporadas="Opcional: T1: URL; T2: URL; T3: URL")
-@app_commands.autocomplete(anime=autocomplete)
-async def seguir(inter: discord.Interaction, anime: str, link: Optional[str] = None,
+# Busca unificada para /seguir, /seguir_conteudo e /seguir_varios.
+# TVmaze funciona sem chave; TMDB necessita de TMDB_API_KEY.
+async def resultados_por_categoria(titulo: str, categoria: str, limite: int = 10):
+    resultados = []
+    if TMDB_API_KEY:
+        try:
+            dados = await tmdb_json(f"/search/{kind(categoria)}", {
+                "query": titulo, "include_adult": "false"}) or {}
+            resultados.extend(("tmdb", r) for r in dados.get("results", [])[:limite])
+        except Exception as exc:
+            print("Erro na pesquisa TMDB:", type(exc).__name__, str(exc))
+    if categoria in TIPOS_TV and len(resultados) < min(5, limite):
+        try:
+            dados = await api_json(f"{TVMAZE_API}/search/shows", {"q": titulo}) or []
+            resultados.extend(("tvmaze", x["show"]) for x in dados[:limite-len(resultados)]
+                              if x.get("show"))
+        except Exception as exc:
+            print("Erro na pesquisa TVmaze:", type(exc).__name__, str(exc))
+    return resultados[:limite]
+
+
+async def autocomplete_todos_titulos(inter: discord.Interaction, atual: str):
+    """Após selecionar a categoria, lista resultados das APIs correspondentes."""
+    categoria = getattr(inter.namespace, "categoria", None)
+    categoria = getattr(categoria, "value", categoria) or "Anime"
+    if len(atual.strip()) < 2:
+        return []
+    try:
+        if categoria == "Anime":
+            q = """query($s:String){Page(perPage:20){media(search:$s,type:ANIME,sort:SEARCH_MATCH){
+                id title{romaji english}}}}"""
+            dados = await anilist(bot.session, q, {"s": atual})
+            return [app_commands.Choice(name=nome(x["title"])[:100], value=f"al:{x['id']}")
+                    for x in (dados.get("Page") or {}).get("media", [])][:25]
+        resultados = await resultados_por_categoria(atual, categoria, 15)
+        saida = []
+        for origem, r in resultados:
+            titulo = r.get("name") or r.get("title") or "Sem título"
+            ano = (r.get("first_air_date") or r.get("release_date") or
+                   r.get("premiered") or "????")[:4]
+            saida.append(app_commands.Choice(
+                name=f"{titulo[:78]} ({ano}) · {origem.upper()}"[:100],
+                value=f"{origem}:{r['id']}"))
+        return saida[:25]
+    except Exception as exc:
+        print("Falha no autocomplete /seguir:", type(exc).__name__)
+        return []
+
+
+@bot.tree.command(name="seguir", description="Seguir anime, dorama, K-drama, série, filme e outras categorias")
+@app_commands.describe(categoria="Tipo de obra", titulo="Pesquise e escolha o título correto",
+                       plataforma="Streaming opcional (ex.: Crunchyroll, Netflix)",
+                       link="Link opcional da obra ou temporada",
+                       temporada="Temporada à qual o link corresponde (opcional)",
+                       temporadas="Ex.: T1: URL; T2: URL; T3: URL")
+@app_commands.choices(categoria=[app_commands.Choice(name=t, value=t) for t in TIPOS_ALERTA])
+@app_commands.autocomplete(titulo=autocomplete_todos_titulos)
+async def seguir(inter: discord.Interaction, categoria: app_commands.Choice[str],
+                titulo: str, plataforma: Optional[str] = None, link: Optional[str] = None,
                 temporada: Optional[app_commands.Range[int, 1, 100]] = None,
                 temporadas: Optional[str] = None):
-    if not anime.isdigit():
-        return await inter.response.send_message("Escolha um item da lista de sugestões.", ephemeral=True)
+    tipo = categoria.value
     try:
         fontes = ler_links_opcionais(link, temporada, temporadas)
     except ValueError as exc:
         return await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
-    q = "query($id:Int){Media(id:$id){id title{romaji english}}}"
-    m = (await anilist(bot.session, q, {"id": int(anime)}))["Media"]
-    db.execute("INSERT OR REPLACE INTO follows VALUES(?,?,?)", (inter.user.id, m["id"], nome(m["title"])))
-    if fontes:
-        gravar_links(inter.user.id, "anilist", m["id"], fontes)
-    if temporada is not None:
-        db.execute("INSERT OR REPLACE INTO anime_temporada_ativa VALUES(?,?,?)",
-                   (inter.user.id, int(m["id"]), temporada))
-    db.commit()
-    await inter.response.send_message(f"✅ Agora você segue **{nome(m['title'])}**."
-        + (f" {len(fontes)} link(s) cadastrado(s)." if fontes else ""), ephemeral=True)
+    await inter.response.defer(ephemeral=True)
+    if tipo == "Anime":
+        # Anime continua usando AniList, sem depender de chave TMDB.
+        try:
+            if re.fullmatch(r"al:\d+", titulo):
+                mid = int(titulo.split(":", 1)[1])
+                q = "query($id:Int){Media(id:$id,type:ANIME){id title{romaji english}}}"
+                media = (await anilist(bot.session, q, {"id": mid})).get("Media")
+            else:
+                media = await buscar_anime(titulo)
+            if not media:
+                return await inter.followup.send("Anime não encontrado no AniList.", ephemeral=True)
+            mid = int(media["id"])
+            titulo_certo = nome(media["title"])
+            db.execute("INSERT OR REPLACE INTO follows VALUES(?,?,?)",
+                       (inter.user.id, mid, titulo_certo))
+            if fontes:
+                gravar_links(inter.user.id, "anilist", mid, fontes)
+            if temporada:
+                db.execute("INSERT OR REPLACE INTO anime_temporada_ativa VALUES(?,?,?)",
+                           (inter.user.id, mid, temporada))
+            db.commit()
+            return await inter.followup.send(
+                f"✅ Agora você segue **{discord.utils.escape_markdown(titulo_certo)}** (Anime)."
+                + (f" 🔗 {len(fontes)} link(s) salvo(s)." if fontes else "")
+                + " Configure `/canal` para avisos de animes.", ephemeral=True)
+        except Exception as exc:
+            print("Erro ao cadastrar anime:", type(exc).__name__, str(exc))
+            return await inter.followup.send("⚠️ Não consegui consultar o AniList agora.", ephemeral=True)
+
+    plataforma = (plataforma or "Não informada").strip()[:100]
+    # Quando o Discord retorna uma sugestão da API, consulta o ID exato.
+    resultados = []
+    selecionado = re.fullmatch(r"(tmdb|tvmaze):(\d+)", titulo)
+    if selecionado:
+        origem, mid = selecionado.group(1), int(selecionado.group(2))
+        try:
+            if origem == "tmdb":
+                r = await tmdb_json(f"/{kind(tipo)}/{mid}")
+            elif tipo in TIPOS_TV:
+                r = await api_json(f"{TVMAZE_API}/shows/{mid}")
+            else:
+                r = None
+            if r and r.get("id"):
+                resultados = [(origem, r)]
+        except Exception as exc:
+            print("Erro ao consultar título escolhido:", type(exc).__name__, str(exc))
+    else:
+        resultados = await resultados_por_categoria(titulo.strip(), tipo)
+    if not resultados:
+        return await inter.followup.send(
+            "Não encontrei essa obra. Confira o título e tente novamente."
+            + (" Configure `TMDB_API_KEY` na FadeHost." if not TMDB_API_KEY else ""),
+            ephemeral=True)
+    await inter.followup.send("🔎 **Confirme a obra correta para acompanhar:**",
+        view=ResultadosConteudo(inter.user.id, titulo, tipo, plataforma,
+                                resultados[:25], fontes), ephemeral=True)
 
 
 async def seguindo_ac(inter: discord.Interaction, atual: str):
@@ -411,10 +518,11 @@ async def canal(inter: discord.Interaction):
 
 
 # ---------------------------------------------------------------------------
-# Seguir/remover vários animes de uma vez + lista numerada
+# Acompanhamento e remoção em lote para todas as categorias, inclusive animes.
+# A lista é unificada com as obras de /seguir e /seguir_conteudo.
 # ---------------------------------------------------------------------------
 def dividir(texto: str) -> list[str]:
-    """Separa por vírgula, ponto e vírgula ou quebra de linha."""
+    """Separa títulos por vírgula, ponto e vírgula ou quebra de linha."""
     return [p.strip() for p in re.split(r"[,;\n]+", texto) if p.strip()]
 
 
@@ -422,96 +530,292 @@ async def buscar_anime(texto: str) -> Optional[dict]:
     q = """query($s:String){Media(search:$s,type:ANIME,sort:SEARCH_MATCH){id title{romaji english}}}"""
     try:
         return (await anilist(bot.session, q, {"s": texto}))["Media"]
-    except Exception:
+    except Exception as exc:
+        print("Falha na pesquisa AniList:", type(exc).__name__)
         return None
 
 
-@bot.tree.command(name="seguir_varios", description="Seguir vários animes de uma vez (separe por vírgula)")
-@app_commands.describe(nomes="Ex.: Jujutsu Kaisen, One Piece, Frieren")
-async def seguir_varios(inter: discord.Interaction, nomes: str):
+def categoria_de_prefixo(nome_categoria: str) -> Optional[str]:
+    """Converte prefixos como 'Série:' ou 'K-drama:' na categoria do Discord."""
+    def limpar(texto):
+        return unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode().casefold().strip()
+    return next((t for t in TIPOS_ALERTA if limpar(t) == limpar(nome_categoria)), None)
+
+
+def identificar_item_lote(item: str, padrao: str) -> tuple[str, str]:
+    pref = re.match(r"^([^:]{2,28}):\s*(.+)$", item)
+    if pref:
+        categoria = categoria_de_prefixo(pref.group(1))
+        if categoria:
+            return categoria, pref.group(2).strip()
+    return padrao, item.strip()
+
+
+async def pesquisar_titulo_exato(titulo: str, categoria: str) -> Optional[tuple[str, dict]]:
+    """Não associa automaticamente homônimos: exige correspondência exata.
+
+    Para casos ambíguos, o usuário usa /seguir, que mostra uma lista de confirmação.
+    """
+    resultados = await resultados_por_categoria(titulo, categoria, 15)
+    candidatos = []
+    alvo = normalizar(titulo)
+    for origem, r in resultados:
+        nomes = (r.get("name"), r.get("title"), r.get("original_name"),
+                 r.get("original_title"))
+        if any(normalizar(n or "") == alvo for n in nomes):
+            candidatos.append((origem, r))
+    # TMDB e TVmaze podem listar a MESMA obra; prefira TMDB quando houver
+    # exatamente um resultado com o mesmo título. Se houver homônimos,
+    # não escolha um ano aleatório: peça confirmação no /seguir.
+    for fonte in ("tmdb", "tvmaze"):
+        unicos = {int(r["id"]): (origem, r) for origem, r in candidatos if origem == fonte}
+        if len(unicos) == 1:
+            return next(iter(unicos.values()))
+        if len(unicos) > 1:
+            return None
+    return None
+
+
+async def salvar_item_lote(user_id: int, categoria: str, titulo: str,
+                           plataforma: str) -> tuple[bool, str]:
+    if categoria == "Anime":
+        media = await buscar_anime(titulo)
+        if not media:
+            return False, "não encontrado no AniList"
+        encontrado = nome(media["title"])
+        # Animes costumam ter título traduzido; avisamos qual foi associado.
+        mid = int(media["id"])
+        existe = db.execute("SELECT 1 FROM follows WHERE user_id=? AND media_id=?",
+                            (user_id, mid)).fetchone()
+        db.execute("INSERT OR IGNORE INTO follows VALUES(?,?,?)",
+                   (user_id, mid, encontrado))
+        return True, f"{encontrado} (Anime)" + (" · já seguia" if existe else "")
+    achado = await pesquisar_titulo_exato(titulo, categoria)
+    if not achado:
+        return False, "nome ambíguo ou não encontrado; use /seguir para confirmar"
+    origem, media = achado
+    mid = int(media["id"])
+    nome_certo = media.get("name") or media.get("title") or titulo
+    ano = media.get("first_air_date") or media.get("release_date") or media.get("premiered")
+    tvmaze_id = mid if origem == "tvmaze" else None
+    imagem = (media.get("image") or {}).get("medium") if origem == "tvmaze" else (
+        "https://image.tmdb.org/t/p/w500" + media["poster_path"]
+        if media.get("poster_path") else None)
+    existe = db.execute("""SELECT id FROM conteudos_seguidos
+              WHERE user_id=? AND origem=? AND mid=? AND tipo=?""",
+              (user_id, origem, mid, categoria)).fetchone()
+    if existe:
+        return True, f"{nome_certo} ({categoria}) · já seguia"
+    try:
+        db.execute("""INSERT INTO conteudos_seguidos
+             (user_id,titulo,tipo,plataforma,criado_em,origem,mid,tvmaze_id,poster_url)
+             VALUES(?,?,?,?,?,?,?,?,?)""",
+             (user_id, nome_certo, categoria, plataforma, int(time.time()),
+              origem, mid, tvmaze_id, imagem))
+    except sqlite3.IntegrityError:
+        return True, f"{nome_certo} ({categoria}) · já seguia"
+    # TVmaze tenta vincular a temporada da série em verificações posteriores.
+    return True, f"{nome_certo} ({categoria})" + (f" · {str(ano)[:4]}" if ano else "")
+
+
+@bot.tree.command(name="seguir_varios", description="Seguir várias obras de qualquer categoria de uma vez")
+@app_commands.describe(nomes="Ex.: Anime: Frieren; Série: Dark; K-drama: Queen of Tears",
+                       categoria="Categoria padrão dos títulos sem prefixo",
+                       plataforma="Streaming de referência (opcional)")
+@app_commands.choices(categoria=[app_commands.Choice(name=x, value=x) for x in TIPOS_ALERTA])
+async def seguir_varios(inter: discord.Interaction, nomes: str,
+                        categoria: Optional[app_commands.Choice[str]] = None,
+                        plataforma: Optional[str] = None):
     itens = dividir(nomes)
     if not itens:
-        return await inter.response.send_message("Escreva pelo menos um nome.", ephemeral=True)
+        return await inter.response.send_message("Informe pelo menos um título.", ephemeral=True)
     if len(itens) > 15:
-        return await inter.response.send_message("Máximo de 15 nomes por vez.", ephemeral=True)
-
+        return await inter.response.send_message("Máximo de 15 títulos por comando.", ephemeral=True)
     await inter.response.defer(ephemeral=True)
+    padrao = categoria.value if categoria else "Anime"
+    plataforma = (plataforma or "Não informada").strip()[:100]
     ok, falhas = [], []
-    for item in itens:
-        m = await buscar_anime(item)
-        if m:
-            db.execute("INSERT OR REPLACE INTO follows VALUES(?,?,?)", (inter.user.id, m["id"], nome(m["title"])))
-            ok.append(f"• {item} → **{nome(m['title'])}**")
-        else:
-            falhas.append(item)
-        await asyncio.sleep(0.7)  # respeita o limite de requisições do AniList
+    for bruto in itens:
+        tipo, titulo = identificar_item_lote(bruto, padrao)
+        try:
+            cadastrado, msg = await salvar_item_lote(inter.user.id, tipo, titulo, plataforma)
+            (ok if cadastrado else falhas).append(f"• {titulo} → {msg}")
+        except Exception as exc:
+            print(f"Falha ao cadastrar em lote ({tipo}):", type(exc).__name__, str(exc))
+            falhas.append(f"• {titulo} ({tipo}) → falha na API")
+        await asyncio.sleep(0.35)
     db.commit()
-
-    partes = []
-    if ok:
-        partes.append("✅ **Agora você segue:**\n" + "\n".join(ok))
+    linhas = (["✅ **Cadastrados / já acompanhados:**", *ok] if ok else [])
     if falhas:
-        partes.append("❌ **Não encontrei** (tente o nome em inglês ou romaji):\n" + "\n".join(f"• {f}" for f in falhas))
-    partes.append("Confira se o anime encontrado é o certo. Se não for, remova com `/remover_varios`.")
-    await inter.followup.send("\n\n".join(partes)[:1900])
+        linhas.extend(["", "⚠️ **Precisam de confirmação:**", *falhas])
+    linhas.extend(["", "🔗 Agora os títulos aparecem em `/links_temporadas`, "
+                   "`/link_temporada`, `/ver_links` e `/remover_link`.",
+                   "Use `/lista` para ver números; escolha canais em `/canal` e `/canal_conteudo`."])
+    await inter.followup.send("\n".join(linhas)[:1900], ephemeral=True)
 
 
-@bot.tree.command(name="lista", description="Animes que você segue (numerados)")
+def lista_unificada(usuario: int) -> list[dict]:
+    """A mesma ordem é utilizada por /lista e /remover_varios."""
+    return sorted(titulos_seguidos_teste(usuario),
+                  key=lambda x: (x["titulo"].casefold(), x["tipo"], x["ref"]))
+
+
+@bot.tree.command(name="lista", description="Lista numerada de todas as obras que você acompanha")
 async def lista(inter: discord.Interaction):
-    rows = db.execute("SELECT title FROM follows WHERE user_id=? ORDER BY rowid", (inter.user.id,)).fetchall()
+    itens = lista_unificada(inter.user.id)
+    if not itens:
+        return await inter.response.send_message("Nenhuma obra seguida. Use `/seguir` ou `/seguir_varios`.", ephemeral=True)
+    linhas = [f"**{i}.** {discord.utils.escape_markdown(x['titulo'])} · {x['tipo']}"
+              for i, x in enumerate(itens, 1)]
+    await inter.response.send_message("\n".join(linhas)[:1900], ephemeral=True)
+
+
+def apagar_seguido(usuario: int, ref: str):
+    """Apaga obra e os links dela apenas se não forem compartilhados por outra entrada."""
+    if ref.startswith("f:"):
+        mid = int(ref[2:])
+        db.execute("DELETE FROM follows WHERE user_id=? AND media_id=?", (usuario, mid))
+        db.execute("DELETE FROM anime_temporada_ativa WHERE user_id=? AND media_id=?", (usuario, mid))
+        origem = "anilist"
+    else:
+        id_conteudo = int(ref[2:])
+        registro = db.execute("SELECT origem,mid FROM conteudos_seguidos WHERE user_id=? AND id=?",
+                              (usuario, id_conteudo)).fetchone()
+        if not registro:
+            return
+        origem, mid = registro
+        db.execute("DELETE FROM conteudos_seguidos WHERE user_id=? AND id=?", (usuario, id_conteudo))
+    if not origem or not mid:
+        return
+    sobrou = db.execute("""SELECT 1 FROM conteudos_seguidos
+       WHERE user_id=? AND origem=? AND mid=? LIMIT 1""", (usuario, origem, mid)).fetchone()
+    if origem == "anilist":
+        sobrou = sobrou or db.execute("SELECT 1 FROM follows WHERE user_id=? AND media_id=?",
+                                    (usuario, mid)).fetchone()
+    if not sobrou:
+        db.execute("DELETE FROM links_temporadas WHERE user_id=? AND origem=? AND mid=?",
+                   (usuario, origem, mid))
+
+
+class MenuRemoverVarios(discord.ui.View):
+    """Seleção paginada de títulos de todas as categorias, com confirmação."""
+    def __init__(self, usuario_id: int):
+        super().__init__(timeout=300)
+        self.usuario_id = usuario_id
+        self.itens = lista_unificada(usuario_id)
+        self.pagina = 0
+        self.selecionados: set[str] = set()
+        self.atualizar_componentes()
+
+    def descricao(self):
+        total_paginas = max(1, (len(self.itens) + 24) // 25)
+        return (f"🗑️ **Selecione as obras para remover** (página {self.pagina+1}/{total_paginas}).\n"
+                f"Você pode marcar títulos de várias categorias e navegar entre páginas.\n"
+                f"**Selecionados: {len(self.selecionados)}** · clique em **Confirmar remoção** ao terminar.")
+
+    async def interaction_check(self, inter: discord.Interaction) -> bool:
+        if inter.user.id != self.usuario_id:
+            await inter.response.send_message("Este menu pertence a outro usuário.", ephemeral=True)
+            return False
+        return True
+
+    def atualizar_componentes(self):
+        self.clear_items()
+        ini = self.pagina * 25
+        atual = self.itens[ini:ini+25]
+        options = [discord.SelectOption(
+            label=f"{ini+i}. {x['titulo']}"[:100],
+            value=x["ref"], description=x["tipo"][:100],
+            default=x["ref"] in self.selecionados)
+            for i, x in enumerate(atual, 1)]
+        seletor = discord.ui.Select(placeholder="Marque uma ou várias obras desta página",
+                                   min_values=1, max_values=len(options), options=options)
+
+        async def selecionar(inter: discord.Interaction):
+            # Deselecting on this page removes from the pending selection.
+            refs_pagina = {x["ref"] for x in atual}
+            self.selecionados.difference_update(refs_pagina)
+            self.selecionados.update(seletor.values)
+            self.atualizar_componentes()
+            await inter.response.edit_message(content=self.descricao(), view=self)
+        seletor.callback = selecionar
+        self.add_item(seletor)
+        anterior = discord.ui.Button(label="Anterior", emoji="⬅️", style=discord.ButtonStyle.secondary,
+                                     disabled=self.pagina == 0)
+        proximo = discord.ui.Button(label="Próxima", emoji="➡️", style=discord.ButtonStyle.secondary,
+                                    disabled=(self.pagina+1)*25 >= len(self.itens))
+        confirmar = discord.ui.Button(label="Confirmar remoção", emoji="🗑️", style=discord.ButtonStyle.danger)
+        cancelar = discord.ui.Button(label="Cancelar", style=discord.ButtonStyle.secondary)
+
+        async def voltar(inter: discord.Interaction):
+            self.pagina -= 1
+            self.atualizar_componentes()
+            await inter.response.edit_message(content=self.descricao(), view=self)
+        async def avancar(inter: discord.Interaction):
+            self.pagina += 1
+            self.atualizar_componentes()
+            await inter.response.edit_message(content=self.descricao(), view=self)
+        async def apagar(inter: discord.Interaction):
+            if not self.selecionados:
+                return await inter.response.send_message("Marque pelo menos uma obra.", ephemeral=True)
+            retirados = [x for x in self.itens if x["ref"] in self.selecionados]
+            for x in retirados:
+                apagar_seguido(self.usuario_id, x["ref"])
+            db.commit()
+            self.stop()
+            resumo = ", ".join(f"{x['titulo']} ({x['tipo']})" for x in retirados)
+            await inter.response.edit_message(content=f"✅ Removidas {len(retirados)} obras: {resumo}"[:1900], view=None)
+        async def encerrar(inter: discord.Interaction):
+            self.stop()
+            await inter.response.edit_message(content="Remoção cancelada. Nenhuma obra foi excluída.", view=None)
+        anterior.callback = voltar
+        proximo.callback = avancar
+        confirmar.callback = apagar
+        cancelar.callback = encerrar
+        for botão in (anterior, proximo, confirmar, cancelar):
+            self.add_item(botão)
+
+
+@bot.tree.command(name="remover_varios", description="Remover várias obras de todas as categorias por nome ou número")
+@app_commands.describe(itens="Opcional: 1, 3, 5-7, Dark, Frieren. Vazio abre menu para marcar obras")
+async def remover_varios(inter: discord.Interaction, itens: Optional[str] = None):
+    rows = lista_unificada(inter.user.id)
     if not rows:
-        return await inter.response.send_message("Você ainda não segue nenhum anime.", ephemeral=True)
-    txt = "\n".join(f"**{i}.** {t}" for i, (t,) in enumerate(rows, 1))
-    await inter.response.send_message(txt[:1900], ephemeral=True)
-
-
-@bot.tree.command(name="remover_varios", description="Remover vários animes por nome ou número da /lista")
-@app_commands.describe(itens="Ex.: 1, 3, 5-7, nome do anime")
-async def remover_varios(inter: discord.Interaction, itens: str):
-    rows = db.execute("SELECT media_id, title FROM follows WHERE user_id=? ORDER BY rowid", (inter.user.id,)).fetchall()
-    if not rows:
-        return await inter.response.send_message("Você ainda não segue nenhum anime.", ephemeral=True)
-
-    remover: dict[int, str] = {}
-    problemas: list[str] = []
+        return await inter.response.send_message("Sua lista está vazia.", ephemeral=True)
+    if not itens or not itens.strip():
+        view = MenuRemoverVarios(inter.user.id)
+        return await inter.response.send_message(view.descricao(), view=view, ephemeral=True)
+    remover = {}
+    problemas = []
     for item in dividir(itens):
         faixa = re.fullmatch(r"(\d+)\s*-\s*(\d+)", item)
         if item.isdigit() or faixa:
-            if faixa:
-                a, b = sorted((int(faixa[1]), int(faixa[2])))
-            else:
-                a = b = int(item)
-            if a < 1 or a > len(rows):
-                problemas.append(f"nº {item}: não existe na lista")
+            a, b = sorted((int(faixa.group(1)), int(faixa.group(2)))) if faixa else (int(item), int(item))
+            if a < 1 or b > len(rows):
+                problemas.append(f"Número/faixa {item} fora de /lista (1 a {len(rows)}).")
                 continue
-            for n in range(a, min(b, len(rows)) + 1):
-                remover[rows[n - 1][0]] = rows[n - 1][1]
+            for n in range(a, b + 1):
+                x = rows[n - 1]
+                remover[x["ref"]] = x
         else:
-            baixo = item.lower()
-            achados = [r for r in rows if r[1].lower() == baixo] or [r for r in rows if baixo in r[1].lower()]
-            if len(achados) == 1:
-                remover[achados[0][0]] = achados[0][1]
-            elif not achados:
-                problemas.append(f"“{item}”: não encontrado na sua lista")
+            exatos = [x for x in rows if normalizar(x["titulo"]) == normalizar(item)]
+            matches = exatos or [x for x in rows if normalizar(item) in normalizar(x["titulo"])]
+            if len(matches) == 1:
+                remover[matches[0]["ref"]] = matches[0]
+            elif not matches:
+                problemas.append(f"{item}: não encontrado")
             else:
-                problemas.append(f"“{item}”: bate com mais de um ({', '.join(r[1] for r in achados[:3])}…). Seja mais específico ou use o número")
-
-    for mid in remover:
-        db.execute("DELETE FROM follows WHERE user_id=? AND media_id=?", (inter.user.id, mid))
-        db.execute("DELETE FROM links_temporadas WHERE user_id=? AND origem='anilist' AND mid=?",
-                   (inter.user.id, mid))
-        db.execute("DELETE FROM anime_temporada_ativa WHERE user_id=? AND media_id=?",
-                   (inter.user.id, mid))
+                problemas.append(f"{item}: mais de uma obra encontrada; use o número da /lista")
+    for ref in remover:
+        apagar_seguido(inter.user.id, ref)
     db.commit()
-
-    partes = []
-    if remover:
-        partes.append("🗑️ **Removidos:**\n" + "\n".join(f"• {t}" for t in remover.values()))
+    linhas = (["🗑️ **Removidos:**"] + [f"• {x['titulo']} · {x['tipo']}" for x in remover.values()]) if remover else []
     if problemas:
-        partes.append("⚠️ **Não consegui:**\n" + "\n".join(f"• {p}" for p in problemas))
-    if remover:
-        partes.append("Os números da lista mudam depois de remover. Use `/lista` para ver a nova.")
-    await inter.response.send_message("\n\n".join(partes)[:1900], ephemeral=True)
+        linhas.extend(["", "⚠️ **Não removidos:**", *[f"• {x}" for x in problemas]])
+    if not linhas:
+        linhas.append("Nada foi removido.")
+    linhas.append("Os números mudam após remover. Veja `/lista` novamente.")
+    await inter.response.send_message("\n".join(linhas)[:1900], ephemeral=True)
 
 
 # ---------------------------------------------------------------------------
@@ -763,19 +1067,7 @@ async def seguir_conteudo(inter: discord.Interaction, titulo: str, tipo: app_com
     except ValueError as exc:
         return await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
     await inter.response.defer(ephemeral=True)
-    resultados = []
-    if TMDB_API_KEY:
-        try:
-            data = await tmdb_json(f"/search/{kind(tipo.value)}", {"query": titulo, "include_adult": "false"})
-            resultados = [("tmdb", x) for x in (data or {}).get("results", [])[:10]]
-        except Exception as e:
-            print("Pesquisa TMDB falhou:", type(e).__name__)
-    if tipo.value in TIPOS_TV and len(resultados) < 5:
-        try:
-            shows = await api_json(f"{TVMAZE_API}/search/shows", {"q": titulo}) or []
-            resultados.extend(("tvmaze", x["show"]) for x in shows[:max(0, 10-len(resultados))] if x.get("show"))
-        except Exception as e:
-            print("Pesquisa TVmaze falhou:", type(e).__name__)
+    resultados = await resultados_por_categoria(titulo, tipo.value)
     if not resultados:
         detalhe = " Configure TMDB_API_KEY na FadeHost." if not TMDB_API_KEY else ""
         return await inter.followup.send("Não encontrei esse título nas APIs." + detalhe, ephemeral=True)
@@ -1530,7 +1822,7 @@ async def banner(inter: discord.Interaction, arquivo: Optional[discord.Attachmen
 # O leitor é efêmero: só quem abriu a leitura vê as páginas.
 # ---------------------------------------------------------------------------
 try:
-    import fitz  # PyMuPDF: opcional, só necessário para ler PDF (adicione `pymupdf` ao requirements.txt)
+    import pymupdf as fitz  # API moderna do PyMuPDF, sem FutureWarning de fitz
 except ImportError:
     fitz = None
 
