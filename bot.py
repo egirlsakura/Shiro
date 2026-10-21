@@ -9,7 +9,7 @@ import time
 import uuid
 import zipfile
 from typing import Optional
-from urllib.parse import quote_plus, urlsplit
+from urllib.parse import quote_plus, urlsplit, parse_qs
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import unicodedata
@@ -110,6 +110,16 @@ for coluna, definicao in (
 db.execute("""INSERT OR IGNORE INTO dm_categorias(dono_id,membro_id,tipo)
               SELECT dono_id,membro_id,'Anime' FROM membros
               WHERE membro_id NOT IN (SELECT user_id FROM dm_bloqueios)""")
+db.executescript("""
+    CREATE TABLE IF NOT EXISTS links_temporadas(
+        user_id INTEGER NOT NULL, origem TEXT NOT NULL, mid INTEGER NOT NULL,
+        temporada INTEGER NOT NULL DEFAULT 0, url TEXT NOT NULL,
+        PRIMARY KEY (user_id, origem, mid, temporada));
+    CREATE TABLE IF NOT EXISTS anime_temporada_ativa(
+        user_id INTEGER NOT NULL, media_id INTEGER NOT NULL,
+        temporada INTEGER NOT NULL,
+        PRIMARY KEY (user_id, media_id));
+""")
 db.commit()
 
 
@@ -165,17 +175,147 @@ async def autocomplete(_: discord.Interaction, atual: str):
     ]
 
 
+# Links opcionais cadastrados pelos membros. 0 = link geral da obra;
+# 1,2,3... = link da temporada correspondente.
+# O link identifica onde consultar o conteúdo, não é evidência de lançamento.
+def normalizar_link_plataforma(url: str) -> str:
+    url = (url or "").strip().strip("<>").replace("\\&", "&")
+    validado = url_legal_externa(url)
+    if not validado:
+        raise ValueError("Informe um link HTTPS público e válido (sem espaços ou credenciais).")
+    parsed = urlsplit(validado)
+    host = (parsed.hostname or "").lower()
+    if host == "netflix.com" or host.endswith(".netflix.com"):
+        # URLs de pesquisa com jbv=12345678 não são páginas estáveis para acompanhar.
+        # Extrai o ID compartilhado pela Netflix e cria a URL oficial do título.
+        jbv = (parse_qs(parsed.query).get("jbv") or [None])[0]
+        original = re.search(r"/(?:title|watch)/(\d{6,12})(?:/|$)", parsed.path)
+        netflix_id = original.group(1) if original else jbv
+        if netflix_id and re.fullmatch(r"\d{6,12}", netflix_id):
+            return f"https://www.netflix.com/br/title/{netflix_id}"
+        if parsed.path.startswith("/search"):
+            raise ValueError("Na Netflix, envie o link do título (/title/123...) ou um link que tenha jbv=123...")
+    return validado
+
+
+def ler_links_opcionais(link: Optional[str] = None, temporada: Optional[int] = None,
+                        temporadas: Optional[str] = None) -> dict[int, str]:
+    """Aceita link simples e/ou 'T1: https://...; T2: https://...; Geral: ...'."""
+    saida: dict[int, str] = {}
+    if temporada is not None and (temporada < 1 or temporada > 100):
+        raise ValueError("Informe temporada de 1 a 100.")
+    if temporada is not None and not link:
+        raise ValueError("Informe o link junto do número da temporada.")
+    if link:
+        saida[temporada or 0] = normalizar_link_plataforma(link)
+    if temporadas:
+        partes = [x.strip() for x in re.split(r"[;\n]+", temporadas) if x.strip()]
+        if len(partes) > 15:
+            raise ValueError("Cadastre no máximo 15 links de temporadas por comando.")
+        for parte in partes:
+            m = re.fullmatch(r"(?i)(?:T(?:emporada)?\s*0*(\d{1,3})|(geral|base|obra))\s*:\s*(https://\S+)", parte)
+            if not m:
+                raise ValueError("Formato inválido. Ex.: T1: https://site/1; T2: https://site/2")
+            num = int(m.group(1)) if m.group(1) else 0
+            if num > 100 or (m.group(1) and num < 1):
+                raise ValueError("A temporada precisa ser de T1 a T100.")
+            saida[num] = normalizar_link_plataforma(m.group(3))
+    if len(saida) > 15:
+        raise ValueError("Cadastre no máximo 15 links por vez.")
+    return saida
+
+
+def gravar_links(user_id: int, origem: str, mid: int, links: dict[int, str]):
+    for numero, url in links.items():
+        db.execute("""INSERT OR REPLACE INTO links_temporadas
+                     (user_id,origem,mid,temporada,url) VALUES (?,?,?,?,?)""",
+                   (user_id, origem, int(mid), int(numero), url))
+    db.commit()
+
+
+def links_de_usuarios(usuarios: list[int], origem: str, mid: int,
+                      temporada: Optional[int] = None) -> list[tuple[int, str]]:
+    """A temporada exata ganha prioridade; o geral é o fallback.
+    Quando não existe identificação de temporada (caso do AniList), não supõe
+    que um link T3 seja da T1: admite um único link específico ou o geral.
+    """
+    if not usuarios:
+        return []
+    usuarios = list(dict.fromkeys(int(u) for u in usuarios))[:150]
+    placeholders = ",".join("?" for _ in usuarios)
+    if origem == "anilist" and temporada is None:
+        preferencias = db.execute(f"""SELECT DISTINCT temporada FROM anime_temporada_ativa
+                 WHERE media_id=? AND user_id IN ({placeholders})""",
+                 (int(mid), *usuarios)).fetchall()
+        if len(preferencias) == 1:
+            temporada = int(preferencias[0][0])
+    rows = db.execute(f"""SELECT temporada,url FROM links_temporadas
+                    WHERE origem=? AND mid=? AND user_id IN ({placeholders})""",
+                    (origem, int(mid), *usuarios)).fetchall()
+    if not rows:
+        return []
+    por_temporada: dict[int, list[str]] = {}
+    for num, url in rows:
+        por_temporada.setdefault(int(num), [])
+        if url not in por_temporada[num]:
+            por_temporada[num].append(url)
+    ordem: list[int] = []
+    if temporada is not None and int(temporada) in por_temporada:
+        ordem.append(int(temporada))
+    ordem.append(0)
+    if temporada is None and len([x for x in por_temporada if x > 0]) == 1:
+        ordem.extend(x for x in por_temporada if x > 0)
+    resultado = []
+    for n in ordem:
+        for url in por_temporada.get(n, []):
+            if url not in [v for _, v in resultado]:
+                resultado.append((n, url))
+            if len(resultado) == 2:
+                return resultado
+    return resultado
+
+
+def botoes_links_usuario(view: discord.ui.View, links: list[tuple[int, str]],
+                          urls: set[str], limite: int = 5):
+    for num, endereco in links:
+        valido = url_legal_externa(endereco)
+        if not valido or valido in urls or len(view.children) >= limite:
+            continue
+        dominio = (urlsplit(valido).hostname or "plataforma").removeprefix("www.")
+        if num:
+            rotulo = f"▶️ Abrir T{num} em {dominio}"
+        else:
+            rotulo = f"▶️ Abrir obra em {dominio}"
+        # Não chama de 'assistir episódio exato': a URL é da obra/temporada.
+        view.add_item(discord.ui.Button(label=rotulo[:80], url=valido))
+        urls.add(valido)
+
+
 @bot.tree.command(name="seguir", description="Seguir um anime para receber aviso de episódios")
-@app_commands.describe(anime="Nome do anime")
+@app_commands.describe(anime="Nome do anime", link="Opcional: link da obra ou temporada",
+                       temporada="Opcional: número da temporada a que pertence o link",
+                       temporadas="Opcional: T1: URL; T2: URL; T3: URL")
 @app_commands.autocomplete(anime=autocomplete)
-async def seguir(inter: discord.Interaction, anime: str):
+async def seguir(inter: discord.Interaction, anime: str, link: Optional[str] = None,
+                temporada: Optional[app_commands.Range[int, 1, 100]] = None,
+                temporadas: Optional[str] = None):
     if not anime.isdigit():
         return await inter.response.send_message("Escolha um item da lista de sugestões.", ephemeral=True)
+    try:
+        fontes = ler_links_opcionais(link, temporada, temporadas)
+    except ValueError as exc:
+        return await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
     q = "query($id:Int){Media(id:$id){id title{romaji english}}}"
     m = (await anilist(bot.session, q, {"id": int(anime)}))["Media"]
     db.execute("INSERT OR REPLACE INTO follows VALUES(?,?,?)", (inter.user.id, m["id"], nome(m["title"])))
+    if fontes:
+        gravar_links(inter.user.id, "anilist", m["id"], fontes)
+    if temporada is not None:
+        db.execute("INSERT OR REPLACE INTO anime_temporada_ativa VALUES(?,?,?)",
+                   (inter.user.id, int(m["id"]), temporada))
     db.commit()
-    await inter.response.send_message(f"✅ Agora você segue **{nome(m['title'])}**.", ephemeral=True)
+    await inter.response.send_message(f"✅ Agora você segue **{nome(m['title'])}**."
+        + (f" {len(fontes)} link(s) cadastrado(s)." if fontes else ""), ephemeral=True)
 
 
 async def seguindo_ac(inter: discord.Interaction, atual: str):
@@ -189,7 +329,13 @@ async def seguindo_ac(inter: discord.Interaction, atual: str):
 @bot.tree.command(name="deixar", description="Parar de seguir um anime")
 @app_commands.autocomplete(anime=seguindo_ac)
 async def deixar(inter: discord.Interaction, anime: str):
+    if not anime.isdigit():
+        return await inter.response.send_message("Selecione um anime das sugestões.", ephemeral=True)
     db.execute("DELETE FROM follows WHERE user_id=? AND media_id=?", (inter.user.id, int(anime)))
+    db.execute("DELETE FROM links_temporadas WHERE user_id=? AND origem='anilist' AND mid=?",
+               (inter.user.id, int(anime)))
+    db.execute("DELETE FROM anime_temporada_ativa WHERE user_id=? AND media_id=?",
+               (inter.user.id, int(anime)))
     db.commit()
     await inter.response.send_message("🗑️ Removido.", ephemeral=True)
 
@@ -352,6 +498,10 @@ async def remover_varios(inter: discord.Interaction, itens: str):
 
     for mid in remover:
         db.execute("DELETE FROM follows WHERE user_id=? AND media_id=?", (inter.user.id, mid))
+        db.execute("DELETE FROM links_temporadas WHERE user_id=? AND origem='anilist' AND mid=?",
+                   (inter.user.id, mid))
+        db.execute("DELETE FROM anime_temporada_ativa WHERE user_id=? AND media_id=?",
+                   (inter.user.id, mid))
     db.commit()
 
     partes = []
@@ -533,9 +683,11 @@ async def encontrar_tvmaze(nome_txt: str, tmdb_id: Optional[int] = None, ano: Op
 
 class ResultadosConteudo(discord.ui.View):
     """Confirma o título escolhido para não acompanhar um homônimo por engano."""
-    def __init__(self, usuario: int, titulo: str, tipo: str, plataforma: str, resultados: list):
+    def __init__(self, usuario: int, titulo: str, tipo: str, plataforma: str,
+                 resultados: list, fontes: Optional[dict[int, str]] = None):
         super().__init__(timeout=180)
         self.usuario, self.titulo, self.tipo, self.plataforma = usuario, titulo, tipo, plataforma
+        self.fontes = fontes or {}
         self.resultados = {f"{k}:{i}": r for i, (k, r) in enumerate(resultados)}
         opcoes = []
         for value, (provider, r) in zip(self.resultados, resultados):
@@ -579,6 +731,8 @@ class ResultadosConteudo(discord.ui.View):
                    (user_id,titulo,tipo,plataforma,criado_em,origem,mid,tvmaze_id,poster_url)
                    VALUES(?,?,?,?,?,?,?,?,?)""",
                    (inter.user.id, titulo, self.tipo, self.plataforma, int(time.time()), provider, mid, tvmaze_id, poster_url))
+            if self.fontes:
+                gravar_links(inter.user.id, provider, mid, self.fontes)
             db.commit()
         except sqlite3.IntegrityError:
             return await inter.followup.send("Esse título já está na sua lista. Use `/meus_conteudos`.", ephemeral=True)
@@ -586,16 +740,28 @@ class ResultadosConteudo(discord.ui.View):
         await inter.edit_original_response(content="✅ **Acompanhamento ativado!**\n"
                                            f"**{discord.utils.escape_markdown(titulo)}** · {self.tipo} · {self.plataforma}\n"
                                            "Escolha os canais em `/canal_conteudo` ou os destinatários em `/dm`.\n"
-                                           "Filmes recebem aviso de **estreia**, não de episódios.", view=None)
+                                           "Filmes recebem aviso de **estreia**, não de episódios."
+                                           + (f"\n🔗 {len(self.fontes)} link(s) de plataforma/temporada salvo(s)."
+                                              if self.fontes else ""), view=None)
 
 
 @bot.tree.command(name="seguir_conteudo", description="Seguir doramas, K-dramas, séries, filmes e animes (TMDB/TVmaze)")
-@app_commands.describe(titulo="Nome da obra", tipo="Categoria", plataforma="Streaming onde você pretende assistir")
+@app_commands.describe(titulo="Nome da obra", tipo="Categoria", plataforma="Streaming onde você pretende assistir",
+                       link="Opcional: link da obra ou temporada",
+                       temporada="Opcional: temporada correspondente ao link (T1, T2...)",
+                       temporadas="Opcional: T1: URL; T2: URL; T3: URL")
 @app_commands.choices(tipo=TIPOS_CONTEUDO)
-async def seguir_conteudo(inter: discord.Interaction, titulo: str, tipo: app_commands.Choice[str], plataforma: str):
+async def seguir_conteudo(inter: discord.Interaction, titulo: str, tipo: app_commands.Choice[str],
+                          plataforma: str, link: Optional[str] = None,
+                          temporada: Optional[app_commands.Range[int, 1, 100]] = None,
+                          temporadas: Optional[str] = None):
     titulo, plataforma = titulo.strip(), plataforma.strip()
     if not titulo or not plataforma or len(titulo) > 150 or len(plataforma) > 100:
         return await inter.response.send_message("Informe título e plataforma válidos (até 150 e 100 caracteres).", ephemeral=True)
+    try:
+        fontes = ler_links_opcionais(link, temporada, temporadas)
+    except ValueError as exc:
+        return await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
     await inter.response.defer(ephemeral=True)
     resultados = []
     if TMDB_API_KEY:
@@ -614,7 +780,7 @@ async def seguir_conteudo(inter: discord.Interaction, titulo: str, tipo: app_com
         detalhe = " Configure TMDB_API_KEY na FadeHost." if not TMDB_API_KEY else ""
         return await inter.followup.send("Não encontrei esse título nas APIs." + detalhe, ephemeral=True)
     await inter.followup.send("🔎 **Selecione o título correto** para acompanhar seus lançamentos:",
-                              view=ResultadosConteudo(inter.user.id, titulo, tipo.value, plataforma, resultados[:25]),
+                              view=ResultadosConteudo(inter.user.id, titulo, tipo.value, plataforma, resultados[:25], fontes),
                               ephemeral=True)
 
 
@@ -639,7 +805,15 @@ async def deixar_conteudo(inter: discord.Interaction, numero: app_commands.Range
     if numero > len(rows):
         return await inter.response.send_message("Esse número não existe na lista.", ephemeral=True)
     item_id, titulo = rows[numero - 1]
+    row = db.execute("SELECT origem,mid FROM conteudos_seguidos WHERE id=?", (item_id,)).fetchone()
     db.execute("DELETE FROM conteudos_seguidos WHERE id=? AND user_id=?", (item_id, inter.user.id))
+    if row and row[0] and row[1]:
+        existe = db.execute("""SELECT 1 FROM conteudos_seguidos
+                  WHERE user_id=? AND origem=? AND mid=? LIMIT 1""",
+                  (inter.user.id, row[0], row[1])).fetchone()
+        if not existe:
+            db.execute("DELETE FROM links_temporadas WHERE user_id=? AND origem=? AND mid=?",
+                       (inter.user.id, row[0], row[1]))
     db.commit()
     await inter.response.send_message(f"🗑️ **{discord.utils.escape_markdown(titulo)}** removido da sua lista.", ephemeral=True)
 
@@ -1054,7 +1228,8 @@ async def buscar_fontes_catalogo(origem: str, mid: int, tipo: str) -> dict:
 
 def botoes_streaming_conteudo(titulo: str, tipo: str, plataforma: str,
                               origem: str, mid: int,
-                              fontes: Optional[dict] = None) -> discord.ui.View:
+                              fontes: Optional[dict] = None,
+                              links_cadastrados: Optional[list[tuple[int, str]]] = None) -> discord.ui.View:
     """Nunca apresenta link de catálogo como se fosse reprodução do episódio."""
     view = discord.ui.View(timeout=None)
     fontes = fontes or {}
@@ -1068,6 +1243,8 @@ def botoes_streaming_conteudo(titulo: str, tipo: str, plataforma: str,
         urls.add(url)
         view.add_item(discord.ui.Button(label=rotulo[:80], url=url))
 
+    # Links indicados por membros são da obra/temporada e têm prioridade.
+    botoes_links_usuario(view, links_cadastrados or [], urls)
     # TMDB indica provedores por região, mas NÃO retorna URL do episódio.
     if fontes.get("onde_assistir"):
         botao("Onde assistir (Brasil) · JustWatch", fontes["onde_assistir"])
@@ -1110,7 +1287,8 @@ def aviso_teste_conteudo(titulo: str, tipo: str, plataforma: str,
 
 async def enviar_teste_conteudo(canal, titulo: str, tipo: str, plataforma: str,
                                 origem: str, mid: int, tvmaze_id: Optional[int],
-                                poster_url: Optional[str] = None) -> bool:
+                                poster_url: Optional[str] = None,
+                                usuario_id: Optional[int] = None) -> bool:
     """Envia apenas lançamentos que já ocorreram, não marca aviso real como entregue."""
     eps = await buscar_lancamentos(origem, mid, tvmaze_id, tipo)
     agora = datetime.now(timezone.utc)
@@ -1121,7 +1299,9 @@ async def enviar_teste_conteudo(canal, titulo: str, tipo: str, plataforma: str,
     await canal.send(embed=aviso_teste_conteudo(titulo, tipo, plataforma, origem,
                       mid, ep, poster_url),
                      view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid,
-                             await buscar_fontes_catalogo(origem, mid, tipo)))
+                             await buscar_fontes_catalogo(origem, mid, tipo),
+                             links_de_usuarios([usuario_id], origem, mid, ep.get("temporada"))
+                             if usuario_id else []))
     return True
 
 
@@ -1184,7 +1364,8 @@ async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
                 continue
             try:
                 await c.send(" ".join(f"<@{u}>" for u in pessoas), embed=emb,
-                             view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid, fontes),
+                             view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid, fontes,
+                                links_de_usuarios(list(pessoas), origem, mid, ep.get("temporada"))),
                              allowed_mentions=discord.AllowedMentions(users=True))
                 marcar_entregue("canal", cid, origem, mid, ep["key"], tipo)
             except discord.HTTPException as e:
@@ -1195,7 +1376,9 @@ async def despachar_lancamento(origem: str, mid: int, ep: dict, rows: list):
             try:
                 target = await bot.fetch_user(uid)
                 await target.send(embed=emb,
-                                  view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid, fontes))
+                                  view=botoes_streaming_conteudo(titulo, tipo, plataforma, origem, mid, fontes,
+                                        links_de_usuarios([a[0] for a in assinantes], origem,
+                                                          mid, ep.get("temporada"))))
                 marcar_entregue("dm", uid, origem, mid, ep["key"], tipo)
             except discord.HTTPException as e:
                 print(f"Falha no aviso {tipo} para DM {uid}: {e}")
@@ -1958,7 +2141,8 @@ def montar_aviso(ep: dict, modo: str):
 
 def kw_aviso(emb: discord.Embed, links: list[dict], com_botoes: bool,
              episodio_oficial: Optional[dict] = None,
-             fontes: Optional[list[dict]] = None) -> dict:
+             fontes: Optional[list[dict]] = None,
+             links_cadastrados: Optional[list[tuple[int, str]]] = None) -> dict:
     """Um botão específico só existe se AniList fornecer URL do episódio EXATO."""
     kwargs = {"embed": emb}
     if not com_botoes:
@@ -1975,6 +2159,7 @@ def kw_aviso(emb: discord.Embed, links: list[dict], com_botoes: bool,
 
     if episodio_oficial:
         botao("▶️ Assistir episódio mais recente", episodio_oficial.get("url"))
+    botoes_links_usuario(view, links_cadastrados or [], urls)
     # Os links externalLinks são geralmente da OBRA, não de um episódio específico.
     for link in links[:3]:
         botao("Ver na " + str(link.get("site") or "plataforma"), link.get("url"))
@@ -2032,14 +2217,18 @@ async def enviar(ep: dict, lembrete: bool):
         try:
             await canal_obj.send(" ".join(f"<@{u}>" for u in donos),
                                  allowed_mentions=discord.AllowedMentions(users=True),
-                                 **kw_aviso(emb, links, botoes, episodio_oficial, fontes))
+                                 **kw_aviso(emb, links, botoes, episodio_oficial, fontes,
+                                     links_de_usuarios(list(donos), "anilist", m["id"])) )
         except discord.HTTPException as e:
             print(f"Falha ao avisar no canal {cid}: {e}")
 
     for uid in dms:
         try:
             user = await bot.fetch_user(uid)
-            await user.send(**kw_aviso(emb, links, botoes, episodio_oficial, fontes))
+            assinantes = [r[0] for r in db.execute("""SELECT dono_id FROM dm_categorias
+                             WHERE membro_id=? AND tipo='Anime'""", (uid,))]
+            await user.send(**kw_aviso(emb, links, botoes, episodio_oficial, fontes,
+                                     links_de_usuarios(assinantes, "anilist", m["id"])))
         except discord.HTTPException as e:
             print(f"Falha ao enviar DM para {uid}: {e}")
 
@@ -2242,6 +2431,112 @@ async def conteudos_teste_autocomplete(inter: discord.Interaction, atual: str):
             for x in itens[:25]]
 
 
+def obra_pertence_usuario(usuario_id: int, obra: str) -> Optional[tuple[str, int, str]]:
+    item = titulo_seguido_ref(usuario_id, obra)
+    if not item:
+        return None
+    if obra.startswith("f:"):
+        return "anilist", int(obra[2:]), item["titulo"]
+    if obra.startswith("c:"):
+        row = db.execute("SELECT origem,mid,titulo FROM conteudos_seguidos WHERE id=? AND user_id=?",
+                         (int(obra[2:]), usuario_id)).fetchone()
+        if row and row[0] and row[1]:
+            return row[0], int(row[1]), row[2]
+    return None
+
+
+@bot.tree.command(name="links_temporadas", description="Salvar links opcionais T1, T2, T3... de uma obra seguida")
+@app_commands.describe(obra="Selecione uma obra de /seguir ou /seguir_conteudo",
+                       links="Ex.: T1: https://site/1; T2: https://site/2; Geral: https://site/obra")
+@app_commands.autocomplete(obra=titulos_teste_autocomplete)
+async def links_temporadas(inter: discord.Interaction, obra: str, links: str):
+    registro = obra_pertence_usuario(inter.user.id, obra)
+    if not registro:
+        return await inter.response.send_message("Escolha uma obra já cadastrada nas sugestões.", ephemeral=True)
+    try:
+        fontes = ler_links_opcionais(temporadas=links)
+    except ValueError as exc:
+        return await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
+    if not fontes:
+        return await inter.response.send_message("Adicione pelo menos um link.", ephemeral=True)
+    origem, mid, titulo = registro
+    gravar_links(inter.user.id, origem, mid, fontes)
+    await inter.response.send_message(
+        f"✅ **{discord.utils.escape_markdown(titulo)}**: {len(fontes)} link(s) salvos. "
+        "As datas continuam sendo verificadas nas APIs; os links abrem a obra ou temporada.",
+        ephemeral=True)
+
+
+@bot.tree.command(name="link_temporada", description="Adicionar ou atualizar um link geral ou de uma temporada")
+@app_commands.describe(obra="Selecione uma obra acompanhada", url="Link HTTPS da obra/temporada",
+                       temporada="T1, T2, T3... (deixe vazio para link geral da obra)")
+@app_commands.autocomplete(obra=titulos_teste_autocomplete)
+async def link_temporada(inter: discord.Interaction, obra: str, url: str,
+                         temporada: Optional[app_commands.Range[int, 1, 100]] = None):
+    registro = obra_pertence_usuario(inter.user.id, obra)
+    if not registro:
+        return await inter.response.send_message("Escolha uma obra cadastrada nas sugestões.", ephemeral=True)
+    try:
+        link = normalizar_link_plataforma(url)
+    except ValueError as exc:
+        return await inter.response.send_message(f"⚠️ {exc}", ephemeral=True)
+    origem, mid, titulo = registro
+    gravar_links(inter.user.id, origem, mid, {temporada or 0: link})
+    await inter.response.send_message(
+        f"✅ Link de **{discord.utils.escape_markdown(titulo)}** "
+        f"({'T'+str(temporada) if temporada else 'geral'}) atualizado:\n{link}", ephemeral=True)
+
+
+@bot.tree.command(name="temporada_anime", description="Definir temporada correspondente ao anime seguido")
+@app_commands.describe(obra="Escolha um anime da lista /seguir", temporada="Número atual da temporada (1 a 100)")
+@app_commands.autocomplete(obra=titulos_teste_autocomplete)
+async def temporada_anime(inter: discord.Interaction, obra: str,
+                          temporada: app_commands.Range[int, 1, 100]):
+    if not obra.startswith("f:") or not obra_pertence_usuario(inter.user.id, obra):
+        return await inter.response.send_message("Selecione um anime cadastrado com `/seguir`.", ephemeral=True)
+    mid = int(obra[2:])
+    db.execute("INSERT OR REPLACE INTO anime_temporada_ativa VALUES(?,?,?)",
+               (inter.user.id, mid, temporada))
+    db.commit()
+    await inter.response.send_message(f"✅ Anime associado à **T{temporada}** para escolher os links corretos.",
+                                      ephemeral=True)
+
+
+@bot.tree.command(name="ver_links", description="Mostrar os links cadastrados para cada temporada")
+@app_commands.describe(obra="Obra seguida em /seguir ou /seguir_conteudo")
+@app_commands.autocomplete(obra=titulos_teste_autocomplete)
+async def ver_links(inter: discord.Interaction, obra: str):
+    registro = obra_pertence_usuario(inter.user.id, obra)
+    if not registro:
+        return await inter.response.send_message("Escolha uma obra cadastrada nas sugestões.", ephemeral=True)
+    origem, mid, titulo = registro
+    rows = db.execute("""SELECT temporada,url FROM links_temporadas
+                    WHERE user_id=? AND origem=? AND mid=? ORDER BY temporada""",
+                    (inter.user.id, origem, mid)).fetchall()
+    if not rows:
+        return await inter.response.send_message("Esta obra não tem links opcionais cadastrados.", ephemeral=True)
+    linhas = [f"**{'T'+str(n) if n else 'Geral'}:** <{url}>" for n, url in rows]
+    await inter.response.send_message((f"🔗 **{discord.utils.escape_markdown(titulo)}**\n" +
+                                      "\n".join(linhas))[:1900], ephemeral=True)
+
+
+@bot.tree.command(name="remover_link", description="Remover link geral ou de uma temporada")
+@app_commands.describe(obra="Obra seguida", temporada="Número da temporada, vazio = link geral")
+@app_commands.autocomplete(obra=titulos_teste_autocomplete)
+async def remover_link(inter: discord.Interaction, obra: str,
+                       temporada: Optional[app_commands.Range[int, 1, 100]] = None):
+    registro = obra_pertence_usuario(inter.user.id, obra)
+    if not registro:
+        return await inter.response.send_message("Escolha uma obra cadastrada nas sugestões.", ephemeral=True)
+    origem, mid, titulo = registro
+    cursor = db.execute("""DELETE FROM links_temporadas
+                        WHERE user_id=? AND origem=? AND mid=? AND temporada=?""",
+                        (inter.user.id, origem, mid, temporada or 0))
+    db.commit()
+    await inter.response.send_message(
+        ("✅ Link removido." if cursor.rowcount else "Não havia link cadastrado nesta temporada."), ephemeral=True)
+
+
 async def total_episodios_exibidos(origem: str, mid: int, maze: Optional[int],
                                    tipo: str, ja_coletados: Optional[list] = None) -> Optional[int]:
     """Contagem de episódios com data de exibição passada, excluindo especiais.
@@ -2289,10 +2584,13 @@ async def montar_teste_registro(registro: dict, episodios: Optional[list] = None
     fontes = await buscar_fontes_catalogo(registro["origem"], registro["mid"], registro["tipo"])
     return {"embed": emb, "view": botoes_streaming_conteudo(registro["titulo"],
             registro["tipo"], registro["plataforma"], registro["origem"],
-            registro["mid"], fontes)}
+            registro["mid"], fontes,
+            links_de_usuarios([registro["usuario"]], registro["origem"],
+                              registro["mid"], ep.get("temporada"))
+            if registro.get("usuario") else [])}
 
 
-async def montar_teste_anime(ep: dict) -> dict:
+async def montar_teste_anime(ep: dict, usuario_id: Optional[int] = None) -> dict:
     emb, links = montar_aviso(ep, "teste")
     midia = await enriquecer_midia_anilist(ep["media"])
     episodio_oficial = encontrar_streaming_episodio(midia, int(ep.get("episode") or 0))
@@ -2304,7 +2602,9 @@ async def montar_teste_anime(ep: dict) -> dict:
         emb.add_field(name="▶️ Link do episódio", value=(
             "Não foi encontrado link direto oficial deste episódio nas fontes consultadas. "
             "Os demais botões levam a páginas de catálogo ou de busca."), inline=False)
-    return kw_aviso(emb, links, True, episodio_oficial, fontes_catalogo_anime(midia))
+    return kw_aviso(emb, links, True, episodio_oficial, fontes_catalogo_anime(midia),
+                    links_de_usuarios([usuario_id], "anilist", ep["media"]["id"])
+                    if usuario_id else [])
 
 
 async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int] = None,
@@ -2316,7 +2616,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
             return None
         if selecionado.startswith("f:"):
             ep = await ultimo_episodio(int(selecionado[2:]))
-            return await montar_teste_anime(ep) if ep else None
+            return await montar_teste_anime(ep, usuario_id) if ep else None
         reg = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
             FROM conteudos_seguidos WHERE user_id=? AND id=?""",
             (usuario_id, int(selecionado[2:]))).fetchone()
@@ -2331,7 +2631,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
         ep = max(existentes, key=lambda e: e["quando"])
         return await montar_teste_registro({"titulo": titulo, "tipo": tipo,
             "plataforma": plataforma, "origem": origem, "mid": mid,
-            "maze": maze, "poster": poster, "ep": ep}, episodios)
+            "maze": maze, "poster": poster, "ep": ep, "usuario": usuario_id}, episodios)
 
     if categoria == "Anime":
         if anime_id is not None:
@@ -2339,7 +2639,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
         try:
             ep = await anime_recente_global()
             if ep:
-                return await montar_teste_anime(ep)
+                return await montar_teste_anime(ep, usuario_id)
         except Exception as e:
             print("Falha ao buscar anime recente global:", type(e).__name__, e)
         melhor = None
@@ -2351,7 +2651,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
                     melhor = ep
             except Exception as e:
                 print("Falha ao consultar anime seguido para teste:", type(e).__name__, e)
-        return await montar_teste_anime(melhor) if melhor else None
+        return await montar_teste_anime(melhor, usuario_id) if melhor else None
 
     melhor = None
     rows = db.execute("""SELECT titulo,tipo,plataforma,origem,mid,tvmaze_id,poster_url
@@ -2366,7 +2666,7 @@ async def preparar_teste(usuario_id: int, categoria: str, anime_id: Optional[int
                 ep = max(antigos, key=lambda e: e["quando"])
                 registro = {"quando": ep["quando"], "titulo": titulo, "tipo": tipo,
                             "plataforma": plataforma, "origem": origem, "mid": mid,
-                            "maze": maze, "poster": poster, "ep": ep}
+                            "maze": maze, "poster": poster, "ep": ep, "usuario": usuario_id}
                 if melhor is None or ep["quando"] > melhor["quando"]:
                     melhor = registro
         except Exception as e:
