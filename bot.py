@@ -148,22 +148,46 @@ class Bot(discord.Client):
         super().__init__(intents=discord.Intents.default())
         self.tree = app_commands.CommandTree(self)
         self.session: aiohttp.ClientSession | None = None
+        self._guild_commands_checked = False
 
     async def setup_hook(self):
         self.session = aiohttp.ClientSession()
+        # Slash commands são registrados APENAS como globais.
+        # NÃO use copy_global_to()+sync(guild=...), pois isso duplica
+        # cada comando no Discord (uma cópia global + outra no servidor).
         comandos = await self.tree.sync()
         print(f"[Shiro] {len(comandos)} comandos globais sincronizados: "
               + ", ".join(sorted(c.name for c in comandos)))
-        # Opcional: servidor de testes ganha slash commands imediatamente.
-        gid = os.getenv("DISCORD_GUILD_ID", "").strip()
-        if gid.isdigit():
-            guild = discord.Object(id=int(gid))
-            self.tree.copy_global_to(guild=guild)
-            comandos_guild = await self.tree.sync(guild=guild)
-            print(f"[Shiro] {len(comandos_guild)} comandos sincronizados no servidor {gid}.")
         set_last_check(get_last_check())
         checar.start()
         checar_conteudos.start()
+
+    async def on_ready(self):
+        # O cache de servidores ainda não está disponível em setup_hook.
+        # Após conectar, removemos versões ANTIGAS dos comandos locais,
+        # criadas pelas versões anteriores do código.
+        if self._guild_commands_checked:
+            return
+        self._guild_commands_checked = True
+        nomes_globais = {comando.name for comando in self.tree.get_commands()}
+        for servidor in list(self.guilds):
+            try:
+                alvo = discord.Object(id=servidor.id)
+                antigos = await self.tree.fetch_commands(guild=alvo)
+                duplicados = [c.name for c in antigos if c.name in nomes_globais]
+                if not duplicados:
+                    continue
+                # Neste bot não existem comandos próprios de servidor.
+                # Sincronizar uma lista local vazia exclui cópias antigas;
+                # os comandos globais continuam funcionando normalmente.
+                self.tree.clear_commands(guild=alvo)
+                await self.tree.sync(guild=alvo)
+                print(f"[Shiro] Comandos duplicados removidos de "
+                      f"{servidor.name} ({servidor.id}): {', '.join(duplicados)}")
+            except discord.HTTPException as exc:
+                print(f"[Shiro] Não foi possível limpar os comandos locais "
+                      f"de {servidor.name} ({servidor.id}): {exc}")
+        print("[Shiro] Verificação de comandos duplicados concluída.")
 
 
 bot = Bot()
